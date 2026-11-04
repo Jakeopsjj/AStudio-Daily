@@ -1,0 +1,8 @@
+# 每行一个账号。支持以下两种写法，`&` 也可分隔多条。
+#
+# 1. 四段管道：备注|token|account_id|ssoSessionId
+#    ssoSessionId 可以留空，写成：备注|token|account_id
+主号|TOKEN_VALUE|ACCOUNT_ID_VALUE|SSO_SESSION_ID_VALUE
+
+# 2. 原始 Cookie（必须包含 token 与 account_id）
+token=TOKEN_VALUE_2; account_id=ACCOUNT_ID_VALUE_2; ssoSessionId=SSO_SESSION_ID_VALUE_2

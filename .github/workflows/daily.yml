@@ -1,0 +1,44 @@
+name: AStudio Daily
+
+on:
+  # 上游仓库默认不跑定时，避免空跑。
+  # fork 后需要云端定时时，取消下面两行注释。cron 使用 UTC。
+  # schedule:
+  #   - cron: "17 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: AStudio-Daily
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TZ: Asia/Shanghai
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run AStudio Daily
+        env:
+          ASTUDIO_COOKIES: ${{ secrets.ASTUDIO_COOKIES }}
+          ASTUDIO_WAIT_SECONDS: "2.5"
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          BARK_URL: ${{ secrets.BARK_URL }}
+          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+        run: python astudio_daily.py
