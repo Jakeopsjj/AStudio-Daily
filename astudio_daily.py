@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """AStudio（科大讯飞 Astron Studio）每日登录积分观测工具。
 
-上游事实（Agent2Providers v3.4.1，只读协议证据）：
-  - 每日登录积分没有独立 claim 接口，服务端在当天账号网页会话首次活跃时发放。
+上游事实（Agent2Providers v3.4.2 / 3055f416，只读协议证据）：
+  - 每日登录奖励由桌面端启动时的账号初始化触发，没有独立 claim 接口。
   - 账号面根地址：https://agent.xfyun.cn/xingchen-studio/
   - 配置：GET membership/plan-config
   - 余额：GET points/balance
-  - 活跃触发：GET membership/me、GET points/summary
-  - 前后 totalBalance 增加时只报告“观察到余额增长”，不推断增长来源。
+  - 活跃触发：POST tenant-app/v2/init-app，带 Cookie，无请求体
+  - 账号面请求统一发送 studioVersion=3.5.1；仅在 Windows/macOS 或环境覆盖时
+    发送 clientType（Windows 21、macOS 22）。
+  - 成功信封必须同时满足 flag=true、code=0、data 非空；init-app 的 data
+    还必须包含布尔 banned，且 banned=false。
+  - 签到前后分别读取 totalBalance 与 sparkTotalBalance，任一积分池明确正增长
+    才报告 observed；两池都无法成对读取时失败，零增长不伪报成功。
 
 本脚本只使用网页会话 Cookie，不持久化凭据，不读取桌面端文件。
 
@@ -15,6 +20,7 @@
   ASTUDIO_COOKIES       多账号 Cookie，换行或 & 分隔
   ASTUDIO_ACCOUNT_FILE  可选账号文件；未设置时尝试 ./astudio_accounts.txt
   ASTUDIO_PROXY         可选 HTTP(S) 代理
+  ASTUDIO_CLIENT_TYPE   可选客户端类型覆盖；Windows 默认 21、macOS 默认 22
   ASTUDIO_WAIT_SECONDS  活跃触发后的等待秒数，默认 2.5
   PUSHPLUS_TOKEN        PushPlus token
   BARK_URL              Bark URL
@@ -43,21 +49,17 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import requests
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 ACCOUNT_API_BASE = "https://agent.xfyun.cn/xingchen-studio/"
 PLAN_CONFIG_PATH = "membership/plan-config"
 POINTS_BALANCE_PATH = "points/balance"
-MEMBERSHIP_ME_PATH = "membership/me"
-POINTS_SUMMARY_PATH = "points/summary"
+INIT_APP_PATH = "tenant-app/v2/init-app"
+STUDIO_VERSION = "3.5.1"
 DEFAULT_ACCOUNT_FILE = "astudio_accounts.txt"
 DEFAULT_TIMEOUT = 20
 DEFAULT_WAIT_SECONDS = 2.5
 USER_AGENT = "undici"
 PHONE_PATTERN = re.compile(r"(?<!\d)(?:\+?86[- ]?)?(1[3-9]\d{9})(?!\d)")
-FALSE_FLAGS = {"0", "false", "no", "off", "关闭", "否"}
-TRUE_FLAGS = {"1", "true", "yes", "on", "开启", "是"}
-
-
 class AStudioError(Exception):
     """AStudio Daily 的受控错误基类。"""
 
@@ -106,7 +108,7 @@ class Account:
 
 @dataclass
 class Balance:
-    total: Decimal
+    total: Optional[Decimal] = None
     activity: Optional[Decimal] = None
     activity_next_expire: Optional[str] = None
     spark_total: Optional[Decimal] = None
@@ -121,6 +123,9 @@ class RunResult:
     before: Optional[Decimal] = None
     after: Optional[Decimal] = None
     delta: Optional[Decimal] = None
+    before_spark: Optional[Decimal] = None
+    after_spark: Optional[Decimal] = None
+    spark_delta: Optional[Decimal] = None
     plan: str = ""
     plan_name: str = ""
     detail_lines: List[str] = field(default_factory=list)
@@ -151,6 +156,17 @@ def log(message: str) -> None:
 
 def env_text(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
+
+
+def configured_client_type() -> Optional[str]:
+    override = env_text("ASTUDIO_CLIENT_TYPE")
+    if override:
+        return override
+    if sys.platform.startswith("win"):
+        return "21"
+    if sys.platform == "darwin":
+        return "22"
+    return None
 
 
 def redact_phone(text: str) -> str:
@@ -192,39 +208,22 @@ def sanitize_message(message: Any, account: Optional[Account] = None) -> str:
     return redact_phone(text)[:800]
 
 
-def decimal_value(value: Any, field_name: str) -> Decimal:
-    if isinstance(value, bool) or value is None:
-        raise APIError("%s 不是有效数字" % field_name)
+def balance_pool_value(value: Any) -> Optional[Decimal]:
+    """Read one balance pool without treating an invalid sibling as fatal."""
+    if value is None or isinstance(value, bool):
+        return None
     try:
-        number = Decimal(str(value))
+        number = Decimal(str(value).strip())
     except (InvalidOperation, ValueError):
-        raise APIError("%s 不是有效数字" % field_name)
-    if not number.is_finite():
-        raise APIError("%s 不是有限数字" % field_name)
+        return None
+    if not number.is_finite() or number < 0:
+        return None
     return number
 
 
-def optional_decimal(value: Any, field_name: str) -> Optional[Decimal]:
-    if value is None:
-        return None
-    return decimal_value(value, field_name)
-
-
 def activity_enabled(value: Any) -> bool:
-    """Match the upstream contract: only an explicit false value disables it."""
-    if value is False:
-        return False
-    if isinstance(value, (int, float)) and value == 0:
-        return False
-    if isinstance(value, str) and value.strip().lower() in FALSE_FLAGS:
-        return False
-    if value is True:
-        return True
-    if isinstance(value, (int, float)) and value == 1:
-        return True
-    if isinstance(value, str) and value.strip().lower() in TRUE_FLAGS:
-        return True
-    return True
+    """Only boolean false disables the activity; other types continue probing."""
+    return value is not False
 
 
 def format_decimal(value: Optional[Decimal]) -> str:
@@ -445,35 +444,58 @@ class AStudioClient:
         proxy: str = "",
         timeout: int = DEFAULT_TIMEOUT,
         wait_seconds: float = DEFAULT_WAIT_SECONDS,
+        client_type: Optional[str] = None,
+        session_factory: Any = None,
     ) -> None:
         self.timeout = timeout
         self.wait_seconds = wait_seconds
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "Accept": "application/json",
-                "User-Agent": USER_AGENT,
-            }
+        self.proxy = proxy
+        resolved_client_type = client_type or configured_client_type()
+        self.client_type = (
+            str(resolved_client_type).strip() if resolved_client_type else None
         )
-        if proxy:
-            self.session.proxies.update({"http": proxy, "https": proxy})
+        self.session_factory = session_factory or requests.Session
+        self.headers = {
+            "Accept": "application/json",
+            "User-Agent": USER_AGENT,
+            "studioVersion": STUDIO_VERSION,
+        }
+        if self.client_type:
+            self.headers["clientType"] = self.client_type
 
     def _url(self, path: str) -> str:
         return ACCOUNT_API_BASE + path.lstrip("/")
 
-    def get(self, account: Account, path: str) -> Any:
+    def _new_session(self) -> requests.Session:
+        session = self.session_factory()
+        session.headers.update(self.headers)
+        if self.proxy:
+            session.proxies.update({"http": self.proxy, "https": self.proxy})
+        return session
+
+    def _request(self, account: Account, method: str, path: str) -> Any:
         url = self._url(path)
+        session = self._new_session()
         try:
-            response = self.session.get(
-                url,
-                headers={"Cookie": account.cookie_header},
-                timeout=self.timeout,
-                allow_redirects=False,
-            )
+            headers = dict(self.headers)
+            headers["Cookie"] = account.cookie_header
+            kwargs = {
+                "headers": headers,
+                "timeout": self.timeout,
+                "allow_redirects": False,
+            }
+            if method == "GET":
+                response = session.get(url, **kwargs)
+            elif method == "POST":
+                response = session.post(url, **kwargs)
+            else:
+                raise APIError("不支持的账号面请求方法：%s" % method)
         except requests.RequestException as error:
             raise APIError(
                 sanitize_message("%s 网络请求失败：%s" % (path, error), account)
             )
+        finally:
+            session.close()
 
         status = response.status_code
         if status in (401, 403):
@@ -495,12 +517,7 @@ class AStudioClient:
         code = payload.get("code")
         desc = payload.get("desc") or payload.get("message") or payload.get("msg") or ""
         desc_text = sanitize_message(desc, account)
-        code_text = str(code) if code is not None else ""
-        expired = code_text == "80000" or "重新登录" in desc_text
-        if expired:
-            raise SessionExpired(
-                "AStudio 会话已失效：%s" % (desc_text or "需要重新登录")
-            )
+        code_text = str(code).strip() if code is not None else ""
 
         failed = (
             not 200 <= status < 300
@@ -508,11 +525,27 @@ class AStudioClient:
             or (code is not None and code_text != "0")
         )
         if failed:
+            if code_text == "80000" or "重新登录" in desc_text:
+                raise SessionExpired(
+                    "AStudio 会话已失效：%s" % (desc_text or "需要重新登录")
+                )
             detail = "：%s" % desc_text if desc_text else ""
             raise APIError("%s 失败（HTTP %d）%s" % (path, status, detail))
 
+        if payload.get("flag") is not True or code_text != "0":
+            raise APIError("%s 返回的成功状态不完整（HTTP %d）" % (path, status))
+
+        if "data" not in payload or payload.get("data") is None:
+            raise APIError("%s 返回的数据不完整（HTTP %d）" % (path, status))
+
         data = payload.get("data")
-        return {} if data is None else data
+        return data
+
+    def get(self, account: Account, path: str) -> Any:
+        return self._request(account, "GET", path)
+
+    def post_empty(self, account: Account, path: str) -> Any:
+        return self._request(account, "POST", path)
 
     def plan_config(self, account: Account) -> Dict[str, Any]:
         data = self.get(account, PLAN_CONFIG_PATH)
@@ -524,43 +557,49 @@ class AStudioClient:
         data = self.get(account, POINTS_BALANCE_PATH)
         if not isinstance(data, dict):
             raise APIError("points/balance 的 data 不是对象")
-        if "totalBalance" not in data:
-            raise APIError("points/balance 缺少 totalBalance")
-        return Balance(
-            total=decimal_value(data.get("totalBalance"), "totalBalance"),
-            activity=optional_decimal(data.get("activityBalance"), "activityBalance"),
+        balance = Balance(
+            total=balance_pool_value(data.get("totalBalance")),
+            activity=balance_pool_value(data.get("activityBalance")),
             activity_next_expire=(
                 str(data.get("activityNextExpireTime"))
                 if data.get("activityNextExpireTime") is not None
                 else None
             ),
-            spark_total=optional_decimal(
-                data.get("sparkTotalBalance"), "sparkTotalBalance"
-            ),
+            spark_total=balance_pool_value(data.get("sparkTotalBalance")),
         )
+        if balance.total is None and balance.spark_total is None:
+            raise APIError(
+                "points/balance 缺少可读的 totalBalance 或 sparkTotalBalance"
+            )
+        return balance
 
-    def membership(self, account: Account) -> Any:
-        return self.get(account, MEMBERSHIP_ME_PATH)
-
-    def points_summary(self, account: Account) -> Any:
-        return self.get(account, POINTS_SUMMARY_PATH)
+    def init_app(self, account: Account) -> Dict[str, Any]:
+        data = self.post_empty(account, INIT_APP_PATH)
+        if not isinstance(data, dict):
+            raise APIError("tenant-app/v2/init-app 的 data 不是对象")
+        if not isinstance(data.get("banned"), bool):
+            raise APIError("tenant-app/v2/init-app 的 data 缺少布尔字段 banned")
+        if data["banned"]:
+            raise APIError("AStudio 账号已被封禁，无法签到")
+        return data
 
 
 def balance_detail(balance: Balance) -> str:
-    parts = ["通用积分=%s" % format_decimal(balance.total)]
-    if balance.activity is not None:
-        parts.append("活动积分=%s" % format_decimal(balance.activity))
+    parts: List[str] = []
+    if balance.total is not None:
+        parts.append("通用积分=%s" % format_decimal(balance.total))
     if balance.spark_total is not None:
         parts.append("星火积分=%s" % format_decimal(balance.spark_total))
+    if balance.activity is not None:
+        parts.append("活动积分=%s" % format_decimal(balance.activity))
     if balance.activity_next_expire:
         parts.append("活动积分到期=%s" % balance.activity_next_expire)
-    return "；".join(parts)
+    return "；".join(parts) if parts else "无可读积分"
 
 
 def result_line(result: RunResult) -> str:
     icon = {
         "observed": "✅",
-        "unchanged": "ℹ️",
         "disabled": "ℹ️",
         "query": "🔎",
         "failed": "❌",
@@ -590,8 +629,9 @@ def run_account(
                 index=index,
                 label=label,
                 status="query",
-                message="查询完成；未调用 membership/me 或 points/summary",
+                message="查询完成；未调用 tenant-app/v2/init-app",
                 before=balance.total,
+                before_spark=balance.spark_total,
                 plan="AStudio",
                 plan_name=str(config.get("planName") or ""),
                 detail_lines=details,
@@ -608,75 +648,80 @@ def run_account(
             )
 
         before = client.balance(account)
-        touch_errors: List[str] = []
-
-        try:
-            client.membership(account)
-        except SessionExpired:
-            raise
-        except APIError as error:
-            touch_errors.append("membership/me：%s" % sanitize_message(error, account))
-
-        try:
-            client.points_summary(account)
-        except SessionExpired:
-            raise
-        except APIError as error:
-            touch_errors.append("points/summary：%s" % sanitize_message(error, account))
-
+        client.init_app(account)
         wait_seconds = max(0.0, float(client.wait_seconds))
         sleeper(wait_seconds)
         after = client.balance(account)
-        delta = after.total - before.total
+
+        delta = (
+            after.total - before.total
+            if before.total is not None and after.total is not None
+            else None
+        )
+        spark_delta = (
+            after.spark_total - before.spark_total
+            if before.spark_total is not None and after.spark_total is not None
+            else None
+        )
 
         detail_lines = [
             "签到前：%s" % balance_detail(before),
             "签到后：%s" % balance_detail(after),
         ]
-        if touch_errors:
-            detail_lines.extend(touch_errors)
 
-        if delta > 0:
+        if delta is None and spark_delta is None:
+            return RunResult(
+                index=index,
+                label=label,
+                status="failed",
+                message="签到前后两个积分池都无法成对读取，不能核对奖励到账",
+                before=before.total,
+                after=after.total,
+                before_spark=before.spark_total,
+                after_spark=after.spark_total,
+                plan="AStudio",
+                detail_lines=detail_lines,
+            )
+
+        growth_lines: List[str] = []
+        if delta is not None and delta > 0:
+            growth_lines.append("通用积分 +%s" % format_decimal(delta))
+        if spark_delta is not None and spark_delta > 0:
+            growth_lines.append("星火积分 +%s" % format_decimal(spark_delta))
+
+        if growth_lines:
             return RunResult(
                 index=index,
                 label=label,
                 status="observed",
                 message=(
-                    "本轮余额增加 +%s；仅证明观察到余额变化，未区分发放来源"
-                    % format_decimal(delta)
+                    "本轮观察到积分正增长：%s；仅证明观察到余额变化，未区分发放来源"
+                    % "，".join(growth_lines)
                 ),
                 before=before.total,
                 after=after.total,
                 delta=delta,
+                before_spark=before.spark_total,
+                after_spark=after.spark_total,
+                spark_delta=spark_delta,
                 plan="AStudio",
                 detail_lines=detail_lines,
             )
 
-        if touch_errors:
-            return RunResult(
-                index=index,
-                label=label,
-                status="failed",
-                message="余额未增加，且会员/积分汇总活跃触发不完整",
-                before=before.total,
-                after=after.total,
-                delta=delta,
-                plan="AStudio",
-                detail_lines=detail_lines,
-            )
-
-        if delta == 0:
-            message = "余额无变化；可能今日已签到或积分尚未发放，本次不确认成功"
-        else:
-            message = "余额减少 %s；本次未观测到签到发放" % format_decimal(-delta)
         return RunResult(
             index=index,
             label=label,
-            status="unchanged",
-            message=message,
+            status="failed",
+            message=(
+                "每日登录初始化成功，但未观察到任何积分池正增长；"
+                "可能今日已领取或尚未到账，本次不确认成功"
+            ),
             before=before.total,
             after=after.total,
             delta=delta,
+            before_spark=before.spark_total,
+            after_spark=after.spark_total,
+            spark_delta=spark_delta,
             plan="AStudio",
             detail_lines=detail_lines,
         )
@@ -688,7 +733,7 @@ def run_account(
             message=sanitize_message(error, account),
             plan="AStudio",
         )
-    except APIError as error:
+    except AStudioError as error:
         return RunResult(
             index=index,
             label=label,
@@ -768,7 +813,6 @@ def notify_all(title: str, content: str) -> None:
 
 def build_report(results: Sequence[RunResult], query_only: bool) -> str:
     observed = sum(1 for item in results if item.status == "observed")
-    unchanged = sum(1 for item in results if item.status == "unchanged")
     disabled = sum(1 for item in results if item.status == "disabled")
     queried = sum(1 for item in results if item.status == "query")
     failed = sum(1 for item in results if item.status == "failed")
@@ -779,8 +823,8 @@ def build_report(results: Sequence[RunResult], query_only: bool) -> str:
             "账号：%d；查询完成：%d；失败：%d"
             % (len(results), queried, failed)
             if query_only
-            else "账号：%d；观察增长：%d；中性：%d；未启用：%d；失败：%d"
-            % (len(results), observed, unchanged, disabled, failed)
+            else "账号：%d；观察增长：%d；未启用：%d；失败：%d"
+            % (len(results), observed, disabled, failed)
         ),
         "",
     ]

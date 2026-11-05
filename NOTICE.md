@@ -10,10 +10,10 @@
 
 ## 协议证据与 clean-room 声明
 
-本项目的 HTTP 行为依据是公开可读的 `Agent2Providers v3.4.1` 参考实现，tag commit 为：
+本项目的 HTTP 行为依据是公开可读的 `Agent2Providers v3.4.2` 参考实现，tag commit 为：
 
 ```text
-604c4102d5becddc997052d997185a302ed9e74f
+3055f416841c1393ec04294a702603fd41e840aa
 ```
 
 参考仓库使用 AGPL-3.0。`AStudio Daily` 只提取完成互操作所需的公开 HTTP 事实，例如 URL、Cookie 字段、请求方法、响应信封和余额字段；Python 脚本、测试、文档结构、日志文案和错误模型均为本项目独立实现，没有复制其 Rust 源码、目录结构、注释或内部抽象。

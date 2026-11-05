@@ -2,23 +2,23 @@
 
 [简体中文](../README.md) · [English](README.en.md) · [繁體中文](README.zh-Hant.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · [Português (BR)](README.pt-BR.md)
 
-**Observe AStudio (iFlytek Astron Studio) daily login credits with account cookies and honest balance reconciliation.**
+**Trigger the AStudio (iFlytek Astron Studio) desktop account initialization and reconcile both credit pools with account cookies.**
 
 ## What it does
 
-AStudio does not expose a separate daily-credit claim endpoint in the reference contract. The server grants the daily login credit when the account web session becomes active for the day.
+AStudio does not expose a separate daily-credit claim endpoint. The reference client triggers the daily flow with a bodyless `tenant-app/v2/init-app` POST.
 
 This script:
 
 1. reads `membership/plan-config`;
-2. stops neutrally when `dailyLoginEnabled` is `false`;
-3. reads `points/balance` before activation;
-4. requests `membership/me` and `points/summary`;
+2. stops only when the boolean `dailyLoginEnabled` is `false`;
+3. reads `totalBalance` and `sparkTotalBalance` before activation;
+4. sends a bodyless `POST tenant-app/v2/init-app`;
 5. waits 2.5 seconds;
-6. reads `points/balance` again;
-7. reports an observed increase when `totalBalance` actually rises.
+6. reads both credit pools from `points/balance` again;
+7. reports `observed` when either pool increases clearly.
 
-An unchanged balance is reported as `unchanged`: the account may already have signed in, or the credit may not have arrived yet. A positive delta proves only that the balance changed; it does not identify the source.
+If initialization succeeds but neither pool increases, the account is reported as `failed` and the process exits non-zero. A positive delta proves only that the balance changed; it does not identify the source.
 
 ## Account formats
 
@@ -65,6 +65,7 @@ python astudio_daily.py --no-notify
 | `ASTUDIO_COOKIES` | yes* | Multi-account cookie payload. |
 | `ASTUDIO_ACCOUNT_FILE` | optional | Path to an account file. |
 | `ASTUDIO_PROXY` | optional | HTTP(S) proxy. |
+| `ASTUDIO_CLIENT_TYPE` | optional | Overrides `clientType`. Defaults to `21` on Windows and `22` on macOS; omitted on Linux. |
 | `ASTUDIO_TIMEOUT` | optional | Request timeout, default `20`. |
 | `ASTUDIO_WAIT_SECONDS` | optional | Balance recheck delay, default `2.5`. |
 | `PUSHPLUS_TOKEN` | optional | PushPlus. |
@@ -77,24 +78,31 @@ python astudio_daily.py --no-notify
 
 | Status | Meaning |
 | :--- | :--- |
-| `observed` | Balance increased in this run; the source is not inferred. |
-| `unchanged` | No increase in this run; no success claim. |
+| `observed` | At least one credit pool increased in this run; the source is not inferred. |
 | `disabled` | Daily login activity is disabled. |
 | `query` | Read-only query mode. |
-| `failed` | Session, HTTP, contract, or activation failure. |
+| `failed` | Session, HTTP, contract, unreadable balance, initialization failure, or zero growth after successful initialization. |
 
 ## HTTP contract
 
 - Product: AStudio (iFlytek Astron Studio)
 - API base: `https://agent.xfyun.cn/xingchen-studio/`
 - Cookie names: `ssoSessionId`, `sso_sessionid`, `account_id`, `token`
-- Endpoints: `membership/plan-config`, `points/balance`, `membership/me`, `points/summary`
-- Daily requests set only `Accept: application/json` and `Cookie`
-- Login flows use `clientType` (`21` on Windows, `22` on macOS) and `studioVersion: 3.5.1`
+- Daily reads: `GET membership/plan-config`, `GET points/balance`
+- Activation: bodyless `POST tenant-app/v2/init-app` with the account cookie
+- All account requests send `studioVersion: 3.5.1`
+- `clientType` is `21` on Windows and `22` on macOS; Linux omits it unless `ASTUDIO_CLIENT_TYPE` overrides it
+- Success requires `flag=true`, `code=0`, and complete `data`; `init-app` also requires `banned=false`
 - GeeTest is required for SMS sending and password login
 - No separate CSRF token/header is visible in the reference evidence
 
 See [PROTOCOL.md](PROTOCOL.md) for source-level evidence.
+
+## Version
+
+- Script: `v1.1.0`
+- Baseline: `Agent2Providers v3.4.2` / `3055f416841c1393ec04294a702603fd41e840aa`
+- Offline regression: 49 unittest cases
 
 ## Security
 

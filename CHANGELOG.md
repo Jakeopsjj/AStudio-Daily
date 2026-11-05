@@ -2,6 +2,37 @@
 
 所有重要变更记录在这里。版本号遵循语义化版本。
 
+## [1.1.0] - 2026-11-05
+
+### Changed
+
+- 基线升级到 `Agent2Providers v3.4.2` / `3055f416841c1393ec04294a702603fd41e840aa`，实施 AStudio 桌面端初始化增量。
+- 活跃触发改为无 body `POST tenant-app/v2/init-app`，不再使用 `membership/me` 与 `points/summary` 冒充签到动作。
+- 账号面统一发送 `studioVersion: 3.5.1`；Windows 默认 `clientType=21`、macOS `22`，Linux 默认不发送。
+- 签到前后同时读取 `totalBalance` 与 `sparkTotalBalance`，任一池明确正增长才报告 `observed`。
+- 初始化成功但两池均无正增长改为 `failed`，进程退出码为 `1`。
+- `dailyLoginEnabled` 仅布尔 `false` 关闭；数字、字符串、`null` 等非布尔值继续探测。
+- 成功响应必须同时满足 `flag=true`、`code=0`、`data` 完整；`init-app` 还要求 `banned=false`。
+- 会话文案“重新登录”仅在非 2xx、`flag=false` 或非零 `code` 的失败分支触发会话失效。
+- README、PROTOCOL、六语文档和协议摘要全部同步到 `v1.1.0`。
+
+### Fixed
+
+- 修复零增长被标为中性并返回退出码 `0` 的问题。
+- 修复 Linux/Ubuntu Actions 默认伪装 `clientType=21` 的问题。
+- 修复成功信封文案含“重新登录”时被误判为会话失效的问题。
+- 继续使用独立 Session、禁重定向和凭据脱敏，避免多账号 Cookie 串联。
+- 补充模拟 HTTP 回归，覆盖无 body POST、双池、严格信封、封禁、会话失效、平台身份头和退出码。
+
+### Tests
+
+- 完整离线回归共 49 项 unittest。
+- `ruff`、`py_compile`、GitHub Actions YAML 解析与 `git diff --check` 纳入发版前验证。
+
+### Notes
+
+- 未 commit、未 push、未创建 Release。
+
 ## [1.0.0] - 2026-11-04
 
 ### Added

@@ -2,21 +2,21 @@
 
 [简体中文](../README.md) · [English](README.en.md) · [繁體中文](README.zh-Hant.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · [Português (BR)](README.pt-BR.md)
 
-**Observa mudanças de saldo relacionadas aos pontos diários do AStudio (iFlytek Astron Studio) com cookies de sessão web e comparação honesta antes/depois.**
+**Dispara a inicialização desktop do AStudio (iFlytek Astron Studio) e reconcilia os dois pools de pontos com cookies de sessão web.**
 
 ## Funcionamento
 
-O contrato de referência não possui um endpoint separado de resgate dos pontos diários. O servidor concede o crédito quando a sessão web da conta se torna ativa no dia.
+O contrato de referência não possui um endpoint separado de resgate. O cliente desktop inicia o fluxo diário com `POST tenant-app/v2/init-app`, sem body.
 
 1. lê `membership/plan-config`;
-2. encerra de forma neutra quando `dailyLoginEnabled=false`;
-3. lê `points/balance` antes da ativação;
-4. solicita `membership/me` e `points/summary`;
+2. encerra apenas quando o booleano `dailyLoginEnabled=false`;
+3. lê `totalBalance` e `sparkTotalBalance` antes da inicialização;
+4. envia `POST tenant-app/v2/init-app`, sem body;
 5. aguarda 2,5 segundos;
-6. lê `points/balance` novamente;
-7. relata aumento observado quando `totalBalance` realmente cresce.
+6. lê novamente os dois pools de pontos;
+7. relata `observed` quando qualquer pool cresce claramente.
 
-Saldo sem alteração é reportado como `unchanged`: a conta pode já ter feito login no dia ou o crédito ainda não chegou. O script não inventa sucesso. Um delta positivo prova apenas que o saldo mudou; a origem não é inferida.
+Se a inicialização funcionar, mas nenhum pool crescer, a conta é reportada como `failed` e o processo termina com código diferente de zero. Um delta positivo prova apenas que o saldo mudou; a origem não é inferida.
 
 ## Formatos de conta
 
@@ -49,6 +49,7 @@ python astudio_daily.py --no-notify
 | `ASTUDIO_COOKIES` | sim* | Cookies de várias contas. |
 | `ASTUDIO_ACCOUNT_FILE` | opcional | Arquivo de contas. |
 | `ASTUDIO_PROXY` | opcional | Proxy HTTP(S). |
+| `ASTUDIO_CLIENT_TYPE` | opcional | Substitui `clientType`. Windows usa `21`, macOS `22`; Linux omite por padrão. |
 | `ASTUDIO_TIMEOUT` | opcional | Timeout, padrão `20` s. |
 | `ASTUDIO_WAIT_SECONDS` | opcional | Espera antes da nova leitura, padrão `2,5` s. |
 | `PUSHPLUS_TOKEN` | opcional | PushPlus. |
@@ -61,24 +62,31 @@ python astudio_daily.py --no-notify
 
 | Estado | Significado |
 | :--- | :--- |
-| `observed` | O saldo aumentou nesta execução; a origem não é inferida. |
-| `unchanged` | Sem aumento nesta execução; não confirma sucesso. |
+| `observed` | Pelo menos um pool de pontos aumentou nesta execução. |
 | `disabled` | Atividade diária desativada. |
 | `query` | Consulta somente leitura. |
-| `failed` | Falha de sessão, HTTP, contrato ou ativação. |
+| `failed` | Sessão, HTTP, contrato, saldo ilegível, inicialização ou zero crescimento após inicialização bem-sucedida. |
 
 ## Contrato HTTP
 
 - Produto: AStudio (iFlytek Astron Studio)
 - API: `https://agent.xfyun.cn/xingchen-studio/`
 - Cookies: `ssoSessionId`, `sso_sessionid`, `account_id`, `token`
-- Endpoints: `membership/plan-config`, `points/balance`, `membership/me`, `points/summary`
-- Requisições diárias usam somente `Accept: application/json` e `Cookie`
-- Login usa `clientType` (`21` no Windows, `22` no macOS) e `studioVersion: 3.5.1`
+- Leituras diárias: `GET membership/plan-config`, `GET points/balance`
+- Ativação: `POST tenant-app/v2/init-app` sem body, com o cookie da conta
+- Todas as requisições da conta usam `studioVersion: 3.5.1`
+- Windows usa `clientType=21`, macOS `22`; Linux omite por padrão e aceita `ASTUDIO_CLIENT_TYPE`
+- Sucesso exige `flag=true`, `code=0` e `data` completo; `init-app` também exige `banned=false`
 - GeeTest é necessário para envio de SMS e login por senha
 - Não foi encontrado token/header CSRF separado na evidência de referência
 
 Consulte [PROTOCOL.md](PROTOCOL.md).
+
+## Versão
+
+- Script: `v1.1.0`
+- Base: `Agent2Providers v3.4.2` / `3055f416841c1393ec04294a702603fd41e840aa`
+- Regressão offline: 49 testes unittest
 
 ## Segurança
 

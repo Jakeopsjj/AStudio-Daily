@@ -4,7 +4,7 @@
 
 # 🛰️ AStudio Daily
 
-**AStudio（科大讯飞 Astron Studio）每日登录积分观测工具。多账号 Cookie、余额前后回读、活跃触发与中性失败语义。**
+**AStudio（科大讯飞 Astron Studio）每日登录积分观测工具。多账号 Cookie、桌面端初始化触发、双积分池到账核对。**
 
 [简体中文](README.md) · [English](docs/README.en.md) · [繁體中文](docs/README.zh-Hant.md) · [日本語](docs/README.ja.md) · [한국어](docs/README.ko.md) · [Português (BR)](docs/README.pt-BR.md)
 
@@ -37,20 +37,21 @@
 | :--- | :--- |
 | **用途** | 触发 AStudio 当天网页会话活跃，并观测每日登录积分是否实际到账。 |
 | **输入** | 一个或多个 AStudio 网页会话 Cookie。 |
-| **输出** | 账号级前后余额、增量、中性状态和可选推送。 |
+| **输出** | 账号级前后双积分池、增量、失败状态和可选推送。 |
 | **部署** | 青龙面板、GitHub Actions、Windows / Linux 本地运行。 |
 | **依赖** | Python 3.8+ 与 `requests`。 |
-| **观察判据** | 只有签到后 `totalBalance` 大于签到前余额，才报告 `observed`；不推断增长来源。 |
-| **无变化** | 报告 `unchanged` 中性；可能是今日已签，也可能是尚未发放。 |
-| **活动关闭** | `dailyLoginEnabled=false` 时报告 `disabled` 中性。 |
+| **观察判据** | `totalBalance` 或 `sparkTotalBalance` 任一池明确正增长才报告 `observed`。 |
+| **无增长** | 初始化成功但两池均无正增长时报告 `failed`，退出码非 0。 |
+| **活动关闭** | 仅布尔 `dailyLoginEnabled=false` 时报告 `disabled`。 |
 
 ## ✨ 核心能力
 
 - **多账号 Cookie**：支持完整 Cookie、管道格式、JSON 数组和账号文件。
-- **活跃开关对齐**：先读取 `membership/plan-config`；仅明确 false 值视为活动关闭，其他值沿用上游继续触发。
-- **前后余额回读**：签到前读取 `points/balance`，等待后再次读取并比较 `totalBalance`。
-- **真实活跃触发**：依次请求 `membership/me` 与 `points/summary`，不调用未证实的领取接口。
-- **不伪造成功**：余额不变只报中性，不写“已签成功”。
+- **活跃开关对齐**：先读取 `membership/plan-config`；只有布尔 `false` 关闭，非布尔值继续探测。
+- **前后余额回读**：签到前后分别读取 `totalBalance` 与 `sparkTotalBalance`，两池独立计算增量。
+- **真实活跃触发**：调用桌面端同款无 body `POST tenant-app/v2/init-app`，不再用只读接口冒充触发。
+- **不伪造成功**：初始化成功但未观测到任一池正增长时按失败处理。
+- **桌面身份对齐**：账号面统一发送 `studioVersion=3.5.1`；Windows 默认 `clientType=21`、macOS 默认 `22`，Linux 默认不发送。
 - **状态脱敏**：不打印 Cookie、token、完整 account_id、ssoSessionId 或 UID。
 - **重定向隔离**：API 请求不跟随 3xx，避免 Cookie 被带往非目标主机。
 - **多渠道推送**：PushPlus、Bark、企业微信群机器人，配置哪个发哪个。
@@ -60,17 +61,16 @@
 ```text
 读取 Cookie
   → GET membership/plan-config
-  → dailyLoginEnabled=false：中性结束
-  → GET points/balance（前值）
-  → GET membership/me
-  → GET points/summary
+  → 仅布尔 dailyLoginEnabled=false：中性结束
+  → GET points/balance（totalBalance + sparkTotalBalance 前值）
+  → POST tenant-app/v2/init-app（Cookie，无 body）
   → 等待 2.5 秒
-  → GET points/balance（后值）
-  → 后值 > 前值：observed
-  → 后值未增加：unchanged
+  → GET points/balance（双池后值）
+  → 任一池正增长：observed
+  → 两池均未正增长：failed
 ```
 
-没有独立 claim 请求。签到依赖账号会话当天的首次活跃发放。
+没有独立 claim 请求。每日登录奖励由桌面端账号初始化触发。
 
 ## 🔑 账号格式
 
@@ -163,6 +163,7 @@ schedule:
 | `ASTUDIO_COOKIES` | 无 | 环境变量形式的账号配置。 |
 | `ASTUDIO_ACCOUNT_FILE` | 无 | 账号文件路径；未设置时尝试脚本同目录的 `astudio_accounts.txt`。 |
 | `ASTUDIO_PROXY` | 无 | 可选 HTTP(S) 代理。 |
+| `ASTUDIO_CLIENT_TYPE` | 按平台 | 覆盖 `clientType`。Windows 默认 `21`、macOS 默认 `22`；Linux 默认不发送。 |
 | `ASTUDIO_TIMEOUT` | `20` | 单次 HTTP 超时，秒。 |
 | `ASTUDIO_WAIT_SECONDS` | `2.5` | 活跃触发后的余额复查等待时间。 |
 | `PUSHPLUS_TOKEN` | 无 | PushPlus token。 |
@@ -176,7 +177,7 @@ schedule:
 | 参数 | 作用 |
 | :--- | :--- |
 | （无） | 运行全部账号并观测签到。 |
-| `--query` | 只查询 `plan-config` 与余额，不调用 `membership/me` 或 `points/summary` 活跃触发。 |
+| `--query` | 只查询 `plan-config` 与双池余额，不调用 `tenant-app/v2/init-app`。 |
 | `--only N[,N\|A-B]` | 只运行指定序号，例如 `1`、`1,3`、`1-3`。 |
 | `--no-notify` | 关闭本轮推送。 |
 | `--version` | 输出版本。 |
@@ -185,11 +186,10 @@ schedule:
 
 | 状态 | 含义 |
 | :--- | :--- |
-| `observed` | 前后余额真实增加；只证明本轮观察到增长，不区分登录发放、活动、充值或并发任务来源。 |
-| `unchanged` | 余额未增加；可能已签或尚未发放，本次不确认成功。 |
-| `disabled` | `dailyLoginEnabled=false`，当前未启用活动。 |
-| `query` | 仅查询，未执行活跃触发。 |
-| `failed` | 会话失效、HTTP/业务错误、余额字段缺失，或活跃触发与余额复查无法形成完整证据。 |
+| `observed` | 双池任一明确正增长；只证明本轮观察到增长，不区分登录发放、活动、充值或并发任务来源。 |
+| `disabled` | 仅布尔 `dailyLoginEnabled=false`，当前未启用活动。 |
+| `query` | 仅查询，未执行账号初始化触发。 |
+| `failed` | 会话失效、HTTP/业务错误、余额不可读、初始化失败，或初始化成功但两池均未正增长。 |
 
 脚本退出码：存在 `failed` 时为 `1`，配置错误为 `2`，其余为 `0`。
 
@@ -202,8 +202,10 @@ schedule:
 - 产品：`AStudio（科大讯飞 Astron Studio）`
 - 账号面：`https://agent.xfyun.cn/xingchen-studio/`
 - Cookie：`ssoSessionId`、`sso_sessionid`、`account_id`、`token`
-- 日常接口：`Accept: application/json` + `Cookie`
-- 登录接口：Windows `clientType=21`、macOS `22`、`studioVersion=3.5.1`
+- 日常接口：`GET membership/plan-config`、`GET points/balance`
+- 活跃触发：`POST tenant-app/v2/init-app`，Cookie，无请求体
+- 身份头：所有账号面请求带 `studioVersion=3.5.1`；Windows `clientType=21`、macOS `22`，Linux 默认不发送
+- 响应信封：必须同时满足 `flag=true`、`code=0`、`data` 非空；`init-app` 还要求 `banned=false`
 - 极验：短信发送与账号密码登录需要；手机号验证码登录本身不需要
 - CSRF：参考证据中未发现独立 CSRF token/header
 
@@ -219,12 +221,16 @@ python -m py_compile astudio_daily.py tests/test_astudio_daily.py
 - 账号格式与 Cookie 顺序；
 - 成功/失败响应信封；
 - 会话失效业务码；
-- `dailyLoginEnabled` 明确 false 与兼容值；
-- 只有余额增加才确认成功；
-- 余额不变的中性状态；
-- `--query` 不调用已识别的活跃触发接口；
+- `dailyLoginEnabled` 仅布尔 false 关闭，非布尔值继续探测；
+- 双积分池任一正增长才确认 `observed`；
+- 初始化成功但零增长必须 `failed` 且退出码为 `1`；
+- 无 body `POST init-app`、成功信封与 `banned` 校验；
+- `clientType` 的平台默认值与 Linux 缺省不发送；
+- `--query` 不调用 `tenant-app/v2/init-app`；
 - 日志与错误脱敏；
 - PushPlus 与企业微信请求格式。
+
+当前离线回归为 **49 项**。
 
 离线测试通过不等同于真实账号必然签到成功。首次线上运行应以脚本输出的前后余额和账号实际积分页为准。
 
@@ -240,27 +246,27 @@ python -m py_compile astudio_daily.py tests/test_astudio_daily.py
 ## ❓ 常见问题
 
 <details>
-<summary><b>为什么余额没涨却可能已经签到</b></summary>
+<summary><b>为什么官方客户端已签到，本轮仍可能零增长</b></summary>
 
-每日积分是服务端在当天账号会话首次活跃时发放。你手动打开官方客户端或前一天/更早已触发过会话时，本轮第一次读取就可能已经包含当日积分，因此前后余额不变。脚本只能确认本轮观测到的增量，不会把没有发生在本轮的增加算作成功。
+如果你已手动打开官方客户端，本轮第一次读取可能已经包含当日积分，因此前后余额不变。脚本只能确认本轮观测到的增量；初始化成功但两池都无正增长时仍返回 `failed`，不会把历史到账算作本轮成功。
 </details>
 
 <details>
 <summary><b>为什么只有 Cookie 也能运行</b></summary>
 
-余额、会员与每日登录积分都走 `agent.xfyun.cn/xingchen-studio/` 网页会话。`modelBearerToken` 只用于模型调用，本签到流程不依赖它。
+活动配置、双池余额与每日登录初始化都走 `agent.xfyun.cn/xingchen-studio/` 网页会话。`modelBearerToken` 只用于模型调用，本签到流程不依赖它。
 </details>
 
 <details>
 <summary><b>Cookie 多久失效</b></summary>
 
-参考实现未发现续期接口。HTTP 401/403、业务码 `80000` 或响应提示重新登录时，需要重新获取 Cookie。
+参考实现未发现续期接口。HTTP 401/403、业务码 `80000`，或失败信封中的响应提示重新登录时，需要重新获取 Cookie；成功信封中的同类文案不会触发会话失效。
 </details>
 
 <details>
-<summary><b>为什么 `points/summary` 不参与已签判断</b></summary>
+<summary><b>为什么初始化成功但余额没涨仍算失败</b></summary>
 
-参考证据只证明该接口可用于触发会话活跃，没有足够字段证据支持“今日已签”的结构化推断。脚本只把它作为活跃触发，不把未知结构猜成签到状态。
+`tenant-app/v2/init-app` 只能证明桌面端账号初始化成功，不能证明奖励到账。脚本要求 `totalBalance` 或 `sparkTotalBalance` 至少一个池出现明确正增长；两池均无正增长时保留重试语义并返回失败。
 </details>
 
 <details>
@@ -271,8 +277,8 @@ python -m py_compile astudio_daily.py tests/test_astudio_daily.py
 
 ## 📦 版本
 
-- 当前脚本版本：`v1.0.0`
-- 基线：`Agent2Providers v3.4.1`
+- 当前脚本版本：`v1.1.0`
+- 基线：`Agent2Providers v3.4.2` / `3055f416841c1393ec04294a702603fd41e840aa`
 - 变更记录：[CHANGELOG.md](CHANGELOG.md)
 
 ## ⚠️ 免责声明

@@ -25,21 +25,50 @@ class FakeResponse:
         )
 
 
+class FakeHttpSession:
+    def __init__(self, response):
+        self.response = response
+        self.headers = {}
+        self.proxies = {}
+        self.calls = []
+        self.closed = False
+
+    def get(self, url, **kwargs):
+        self.calls.append(("GET", url, kwargs))
+        return self.response
+
+    def post(self, url, **kwargs):
+        self.calls.append(("POST", url, kwargs))
+        return self.response
+
+    def close(self):
+        self.closed = True
+
+
+class FakeHttpTransport:
+    def __init__(self, *responses):
+        self.responses = list(responses)
+        self.sessions = []
+
+    def __call__(self):
+        if not self.responses:
+            raise AssertionError("unexpected HTTP request")
+        session = FakeHttpSession(self.responses.pop(0))
+        self.sessions.append(session)
+        return session
+
+
 class FakeClient:
     def __init__(
         self,
         config=None,
         balances=None,
-        membership=None,
-        summary=None,
+        init_app=None,
         wait_seconds=2.5,
     ):
         self.config = config or {"dailyLoginEnabled": True}
         self.balances = list(balances or [{"totalBalance": 100}])
-        self.membership_data = (
-            membership if membership is not None else {"planName": "Free"}
-        )
-        self.summary_data = summary if summary is not None else {"today": []}
+        self.init_app_data = init_app if init_app is not None else {"banned": False}
         self.wait_seconds = wait_seconds
         self.calls = []
 
@@ -55,20 +84,15 @@ class FakeClient:
         if isinstance(value, Exception):
             raise value
         return MODULE.Balance(
-            total=MODULE.decimal_value(value["totalBalance"], "totalBalance")
+            total=MODULE.balance_pool_value(value.get("totalBalance")),
+            spark_total=MODULE.balance_pool_value(value.get("sparkTotalBalance")),
         )
 
-    def membership(self, account):
-        self.calls.append("membership-me")
-        if isinstance(self.membership_data, Exception):
-            raise self.membership_data
-        return self.membership_data
-
-    def points_summary(self, account):
-        self.calls.append("points-summary")
-        if isinstance(self.summary_data, Exception):
-            raise self.summary_data
-        return self.summary_data
+    def init_app(self, account):
+        self.calls.append("init-app")
+        if isinstance(self.init_app_data, Exception):
+            raise self.init_app_data
+        return self.init_app_data
 
 
 class AccountParsingTests(unittest.TestCase):
@@ -178,92 +202,302 @@ class AccountParsingTests(unittest.TestCase):
 
 
 class ClientContractTests(unittest.TestCase):
-    def make_client(self):
-        client = MODULE.AStudioClient(wait_seconds=0)
-        client.session.get = mock.Mock()
-        return client
-
-    def test_success_envelope_and_request_headers(self):
-        client = self.make_client()
-        client.session.get.return_value = FakeResponse(
-            {"flag": True, "code": 0, "data": {"totalBalance": 12.5}}
+    def make_client(self, *responses, client_type="21"):
+        transport = FakeHttpTransport(*responses)
+        client = MODULE.AStudioClient(
+            wait_seconds=0,
+            client_type=client_type,
+            session_factory=transport,
         )
-        account = MODULE.Account("a", "tok", "acct", "sso")
-        balance = client.balance(account)
+        return client, transport
+
+    def account(self):
+        return MODULE.Account("a", "tok", "acct", "sso")
+
+    def test_success_envelope_headers_and_no_redirects(self):
+        client, transport = self.make_client(
+            FakeResponse(
+                {
+                    "flag": True,
+                    "code": 0,
+                    "data": {"totalBalance": 12.5, "sparkTotalBalance": 3},
+                }
+            )
+        )
+        balance = client.balance(self.account())
         self.assertEqual(balance.total, Decimal("12.5"))
-        kwargs = client.session.get.call_args.kwargs
-        self.assertEqual(
-            kwargs["headers"]["Cookie"],
-            "ssoSessionId=sso; sso_sessionid=sso; account_id=acct; token=tok",
-        )
-        self.assertEqual(kwargs["headers"], {"Cookie": account.cookie_header})
-        self.assertFalse(kwargs["allow_redirects"])
+        self.assertEqual(balance.spark_total, Decimal("3"))
 
-    def test_http_401_is_session_expired(self):
-        client = self.make_client()
-        client.session.get.return_value = FakeResponse({}, status=401)
-        with self.assertRaises(MODULE.SessionExpired):
-            client.plan_config(MODULE.Account("a", "tok", "acct"))
+        session = transport.sessions[0]
+        self.assertEqual(session.headers["Accept"], "application/json")
+        self.assertEqual(session.headers["clientType"], "21")
+        self.assertEqual(session.headers["studioVersion"], "3.5.1")
+        method, url, kwargs = session.calls[0]
+        self.assertEqual(method, "GET")
+        self.assertEqual(
+            url,
+            "https://agent.xfyun.cn/xingchen-studio/points/balance",
+        )
+        self.assertEqual(kwargs["headers"]["Cookie"], self.account().cookie_header)
+        self.assertEqual(kwargs["headers"]["clientType"], "21")
+        self.assertEqual(kwargs["headers"]["studioVersion"], "3.5.1")
+        self.assertFalse(kwargs["allow_redirects"])
+        self.assertTrue(session.closed)
+
+    def test_http_401_and_403_are_session_expired(self):
+        for status in (401, 403):
+            with self.subTest(status=status):
+                client, _ = self.make_client(FakeResponse({}, status=status))
+                with self.assertRaises(MODULE.SessionExpired):
+                    client.plan_config(self.account())
 
     def test_code_80000_is_session_expired(self):
-        client = self.make_client()
-        client.session.get.return_value = FakeResponse(
-            {"flag": False, "code": 80000, "desc": "登录异常，请重新登录"}
+        client, _ = self.make_client(
+            FakeResponse(
+                {"flag": False, "code": 80000, "desc": "登录异常，请重新登录"}
+            )
         )
         with self.assertRaises(MODULE.SessionExpired):
-            client.plan_config(MODULE.Account("a", "tok", "acct"))
+            client.plan_config(self.account())
 
-    def test_business_error_is_not_success(self):
-        client = self.make_client()
-        client.session.get.return_value = FakeResponse(
-            {"flag": True, "code": 7, "desc": "bad request", "data": {}}
+    def test_relogin_message_is_ignored_in_success_envelope(self):
+        client, _ = self.make_client(
+            FakeResponse(
+                {
+                    "flag": True,
+                    "code": 0,
+                    "desc": "网页会话失效，请重新登录",
+                    "data": {},
+                }
+            )
         )
-        with self.assertRaises(MODULE.APIError):
-            client.balance(MODULE.Account("a", "tok", "acct"))
+        self.assertEqual(client.plan_config(self.account()), {})
+
+    def test_relogin_message_is_session_expired_only_in_failure_branches(self):
+        cases = [
+            (
+                FakeResponse(
+                    {"flag": False, "code": 0, "desc": "请重新登录", "data": {}}
+                ),
+                200,
+            ),
+            (
+                FakeResponse(
+                    {"flag": True, "code": 80000, "desc": "会话失效", "data": {}}
+                ),
+                200,
+            ),
+            (
+                FakeResponse(
+                    {"flag": True, "code": 0, "desc": "请重新登录", "data": {}},
+                    status=500,
+                ),
+                500,
+            ),
+        ]
+        for response, expected_status in cases:
+            with self.subTest(status=expected_status):
+                client, _ = self.make_client(response)
+                with self.assertRaises(MODULE.SessionExpired):
+                    client.plan_config(self.account())
+
+    def test_business_error_is_not_success_and_is_sanitized(self):
+        client, _ = self.make_client(
+            FakeResponse(
+                {
+                    "flag": True,
+                    "code": 7,
+                    "desc": "bad request tok",
+                    "data": {},
+                }
+            )
+        )
+        with self.assertRaises(MODULE.APIError) as raised:
+            client.balance(self.account())
+        self.assertNotIn(" tok", str(raised.exception))
+        self.assertIn("[redacted-token]", str(raised.exception))
 
     def test_non_json_is_rejected(self):
-        client = self.make_client()
-        client.session.get.return_value = FakeResponse({}, text="<html>login</html>")
+        client, _ = self.make_client(
+            FakeResponse({}, text="<html>login</html>")
+        )
         with self.assertRaises(MODULE.APIError):
-            client.plan_config(MODULE.Account("a", "tok", "acct"))
+            client.plan_config(self.account())
 
     def test_plan_config_accepts_upstream_flag_variants(self):
-        client = self.make_client()
         for value in ("true", 1, 0, None, False):
             with self.subTest(value=value):
-                client.session.get.return_value = FakeResponse(
-                    {
-                        "flag": True,
-                        "code": 0,
-                        "data": {"dailyLoginEnabled": value},
-                    }
+                client, _ = self.make_client(
+                    FakeResponse(
+                        {
+                            "flag": True,
+                            "code": 0,
+                            "data": {"dailyLoginEnabled": value},
+                        }
+                    )
                 )
-                config = client.plan_config(MODULE.Account("a", "tok", "acct"))
+                config = client.plan_config(self.account())
                 self.assertIn("dailyLoginEnabled", config)
 
-    def test_explicit_false_flag_variants_are_disabled(self):
-        for value in (False, 0, "false", "0", "关闭"):
-            with self.subTest(value=value):
-                self.assertFalse(MODULE.activity_enabled(value))
-        for value in (True, 1, "true", "1", None, "unknown"):
+    def test_only_boolean_false_disables_activity(self):
+        self.assertFalse(MODULE.activity_enabled(False))
+        for value in (True, 0, 1, "false", "0", "关闭", None, "unknown"):
             with self.subTest(value=value):
                 self.assertTrue(MODULE.activity_enabled(value))
 
     def test_login_error_without_relogin_is_not_session_expired(self):
-        client = self.make_client()
-        client.session.get.return_value = FakeResponse(
-            {"flag": False, "code": 7, "desc": "登录异常"}
+        client, _ = self.make_client(
+            FakeResponse({"flag": False, "code": 7, "desc": "登录异常"})
         )
         with self.assertRaises(MODULE.APIError):
-            client.plan_config(MODULE.Account("a", "tok", "acct"))
+            client.plan_config(self.account())
 
-    def test_balance_requires_total_balance(self):
-        client = self.make_client()
-        client.session.get.return_value = FakeResponse(
-            {"flag": True, "code": 0, "data": {"activityBalance": 1}}
+    def test_balance_accepts_either_pool(self):
+        cases = [
+            ({"totalBalance": 5}, Decimal("5"), None),
+            ({"sparkTotalBalance": "7.5"}, None, Decimal("7.5")),
+        ]
+        for data, expected_total, expected_spark in cases:
+            with self.subTest(data=data):
+                client, _ = self.make_client(
+                    FakeResponse({"flag": True, "code": 0, "data": data})
+                )
+                balance = client.balance(self.account())
+                self.assertEqual(balance.total, expected_total)
+                self.assertEqual(balance.spark_total, expected_spark)
+
+    def test_balance_rejects_when_both_pools_are_unreadable(self):
+        client, _ = self.make_client(
+            FakeResponse(
+                {
+                    "flag": True,
+                    "code": 0,
+                    "data": {"totalBalance": "bad", "sparkTotalBalance": -1},
+                }
+            )
         )
         with self.assertRaises(MODULE.APIError):
-            client.balance(MODULE.Account("a", "tok", "acct"))
+            client.balance(self.account())
+
+    def test_success_envelope_requires_flag_code_and_data(self):
+        payloads = [
+            {"code": 0, "data": {}},
+            {"flag": True, "data": {}},
+            {"flag": True, "code": 0},
+            {"flag": "true", "code": 0, "data": {}},
+            {"flag": True, "code": "0", "data": None},
+        ]
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                client, _ = self.make_client(FakeResponse(payload))
+                with self.assertRaises(MODULE.APIError):
+                    client.plan_config(self.account())
+
+    def test_init_app_is_empty_post_and_requires_banned_false(self):
+        client, transport = self.make_client(
+            FakeResponse(
+                {
+                    "flag": True,
+                    "code": 0,
+                    "data": {"banned": False, "tenantApp": "ok"},
+                }
+            )
+        )
+        self.assertEqual(client.init_app(self.account()), {"banned": False, "tenantApp": "ok"})
+
+        session = transport.sessions[0]
+        method, url, kwargs = session.calls[0]
+        self.assertEqual(method, "POST")
+        self.assertEqual(
+            url,
+            "https://agent.xfyun.cn/xingchen-studio/tenant-app/v2/init-app",
+        )
+        self.assertNotIn("json", kwargs)
+        self.assertNotIn("data", kwargs)
+        self.assertNotIn("files", kwargs)
+        self.assertFalse(kwargs["allow_redirects"])
+        self.assertEqual(session.headers["studioVersion"], "3.5.1")
+
+    def test_init_app_rejects_banned_and_incomplete_data(self):
+        for data in ({"banned": True}, {}, {"banned": "false"}, []):
+            with self.subTest(data=data):
+                client, _ = self.make_client(
+                    FakeResponse({"flag": True, "code": 0, "data": data})
+                )
+                with self.assertRaises(MODULE.APIError):
+                    client.init_app(self.account())
+
+    def test_each_request_uses_fresh_session_for_account_isolation(self):
+        first = MODULE.Account("一", "tok-1", "acct-1", "sso-1")
+        second = MODULE.Account("二", "tok-2", "acct-2", "sso-2")
+        client, transport = self.make_client(
+            FakeResponse(
+                {"flag": True, "code": 0, "data": {"dailyLoginEnabled": True}}
+            ),
+            FakeResponse(
+                {"flag": True, "code": 0, "data": {"dailyLoginEnabled": True}}
+            ),
+        )
+        client.plan_config(first)
+        client.plan_config(second)
+
+        self.assertEqual(len(transport.sessions), 2)
+        self.assertIsNot(transport.sessions[0], transport.sessions[1])
+        self.assertEqual(
+            transport.sessions[0].calls[0][2]["headers"]["Cookie"],
+            first.cookie_header,
+        )
+        self.assertEqual(
+            transport.sessions[1].calls[0][2]["headers"]["Cookie"],
+            second.cookie_header,
+        )
+        self.assertNotIn("tok-2", transport.sessions[0].calls[0][2]["headers"]["Cookie"])
+        self.assertNotIn("tok-1", transport.sessions[1].calls[0][2]["headers"]["Cookie"])
+
+    def test_client_type_default_and_environment_override(self):
+        cases = [
+            ("win32", "", "21"),
+            ("linux", "", None),
+            ("darwin", "", "22"),
+            ("linux", "21", "21"),
+        ]
+        for platform_name, override, expected in cases:
+            with self.subTest(
+                platform_name=platform_name,
+                override=override,
+                expected=expected,
+            ):
+                with mock.patch.object(MODULE.sys, "platform", platform_name):
+                    with mock.patch.dict(
+                        os.environ,
+                        {"ASTUDIO_CLIENT_TYPE": override},
+                        clear=False,
+                    ):
+                        transport = FakeHttpTransport(
+                            FakeResponse(
+                                {
+                                    "flag": True,
+                                    "code": 0,
+                                    "data": {"totalBalance": 1},
+                                }
+                            )
+                        )
+                        client = MODULE.AStudioClient(
+                            wait_seconds=0,
+                            session_factory=transport,
+                        )
+                        client.balance(self.account())
+                session = transport.sessions[0]
+                self.assertEqual(session.headers["studioVersion"], "3.5.1")
+                if expected is None:
+                    self.assertNotIn("clientType", session.headers)
+                    self.assertNotIn("clientType", session.calls[0][2]["headers"])
+                else:
+                    self.assertEqual(session.headers["clientType"], expected)
+                    self.assertEqual(
+                        session.calls[0][2]["headers"]["clientType"],
+                        expected,
+                    )
 
 
 class FlowTests(unittest.TestCase):
@@ -277,7 +511,23 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(client.calls, ["plan-config"])
         self.assertFalse(result.observed)
 
-    def test_balance_increase_is_only_reported_as_observed(self):
+    def test_non_boolean_daily_login_flag_continues_probe(self):
+        for value in (0, 1, "false", "0", "关闭", None, "unknown"):
+            with self.subTest(value=value):
+                client = FakeClient(
+                    config={"dailyLoginEnabled": value},
+                    balances=[{"totalBalance": 10}, {"totalBalance": 11}],
+                )
+                result = MODULE.run_account(
+                    1,
+                    self.account(),
+                    client,
+                    sleeper=lambda _: None,
+                )
+                self.assertEqual(result.status, "observed")
+                self.assertIn("init-app", client.calls)
+
+    def test_total_balance_increase_is_only_reported_as_observed(self):
         client = FakeClient(balances=[{"totalBalance": 10}, {"totalBalance": 15}])
         result = MODULE.run_account(1, self.account(), client, sleeper=lambda _: None)
         self.assertEqual(result.status, "observed")
@@ -289,27 +539,82 @@ class FlowTests(unittest.TestCase):
             [
                 "plan-config",
                 "points-balance",
-                "membership-me",
-                "points-summary",
+                "init-app",
                 "points-balance",
             ],
         )
 
-    def test_unchanged_balance_is_neutral(self):
-        client = FakeClient(balances=[{"totalBalance": 10}, {"totalBalance": 10}])
-        result = MODULE.run_account(1, self.account(), client, sleeper=lambda _: None)
-        self.assertEqual(result.status, "unchanged")
-        self.assertIn("可能今日已签到", result.message)
-        self.assertFalse(result.observed)
-
-    def test_failed_touch_plus_no_increase_is_failed(self):
+    def test_spark_balance_increase_is_observed(self):
         client = FakeClient(
-            balances=[{"totalBalance": 10}, {"totalBalance": 10}],
-            summary=MODULE.APIError("summary failed"),
+            balances=[
+                {"totalBalance": 10, "sparkTotalBalance": 2},
+                {"totalBalance": 10, "sparkTotalBalance": 5},
+            ]
+        )
+        result = MODULE.run_account(1, self.account(), client, sleeper=lambda _: None)
+        self.assertEqual(result.status, "observed")
+        self.assertEqual(result.delta, Decimal("0"))
+        self.assertEqual(result.spark_delta, Decimal("3"))
+        self.assertIn("星火积分 +3", result.message)
+        self.assertTrue(result.observed)
+
+    def test_increase_in_one_pool_is_enough_when_other_is_unreadable(self):
+        client = FakeClient(
+            balances=[
+                {"totalBalance": 10},
+                {"totalBalance": 12, "sparkTotalBalance": 5},
+            ]
+        )
+        result = MODULE.run_account(1, self.account(), client, sleeper=lambda _: None)
+        self.assertEqual(result.status, "observed")
+        self.assertEqual(result.delta, Decimal("2"))
+        self.assertIsNone(result.spark_delta)
+
+    def test_zero_growth_after_successful_init_app_is_failed(self):
+        client = FakeClient(
+            balances=[
+                {"totalBalance": 10, "sparkTotalBalance": 2},
+                {"totalBalance": 10, "sparkTotalBalance": 2},
+            ]
         )
         result = MODULE.run_account(1, self.account(), client, sleeper=lambda _: None)
         self.assertEqual(result.status, "failed")
-        self.assertIn("活跃触发不完整", result.message)
+        self.assertIn("未观察到任何积分池正增长", result.message)
+        self.assertFalse(result.observed)
+
+    def test_init_app_failure_is_failed_without_after_balance(self):
+        client = FakeClient(
+            balances=[{"totalBalance": 10}, {"totalBalance": 10}],
+            init_app=MODULE.APIError("init failed"),
+        )
+        result = MODULE.run_account(1, self.account(), client, sleeper=lambda _: None)
+        self.assertEqual(result.status, "failed")
+        self.assertIn("init failed", result.message)
+        self.assertEqual(
+            client.calls,
+            ["plan-config", "points-balance", "init-app"],
+        )
+
+    def test_unpaired_pool_readings_fail(self):
+        client = FakeClient(
+            balances=[
+                {"totalBalance": 10},
+                {"sparkTotalBalance": 5},
+            ]
+        )
+        result = MODULE.run_account(1, self.account(), client, sleeper=lambda _: None)
+        self.assertEqual(result.status, "failed")
+        self.assertIn("无法成对读取", result.message)
+
+    def test_both_pools_unreadable_fail(self):
+        client = FakeClient(
+            balances=[
+                MODULE.APIError("points/balance 缺少可读的 totalBalance 或 sparkTotalBalance")
+            ]
+        )
+        result = MODULE.run_account(1, self.account(), client, sleeper=lambda _: None)
+        self.assertEqual(result.status, "failed")
+        self.assertIn("totalBalance 或 sparkTotalBalance", result.message)
 
     def test_query_mode_does_not_wait_or_use_after_balance(self):
         waits = []
@@ -325,7 +630,7 @@ class FlowTests(unittest.TestCase):
         )
         self.assertEqual(result.status, "query")
         self.assertEqual(waits, [])
-        self.assertIn("未调用 membership/me", result.message)
+        self.assertIn("未调用 tenant-app/v2/init-app", result.message)
         self.assertEqual(client.calls, ["plan-config", "points-balance"])
 
     def test_query_mode_reads_balance_even_when_activity_is_disabled(self):
@@ -359,13 +664,107 @@ class FlowTests(unittest.TestCase):
         self.assertNotIn("super-secret-token", result.message)
         self.assertIn("[redacted-token]", result.message)
 
-    def test_report_does_not_claim_success_when_all_neutral(self):
+    def test_simulated_http_spark_growth_end_to_end(self):
+        transport = FakeHttpTransport(
+            FakeResponse(
+                {
+                    "flag": True,
+                    "code": 0,
+                    "data": {"dailyLoginEnabled": True, "planName": "Free"},
+                }
+            ),
+            FakeResponse(
+                {
+                    "flag": True,
+                    "code": 0,
+                    "data": {"totalBalance": 10, "sparkTotalBalance": 2},
+                }
+            ),
+            FakeResponse(
+                {
+                    "flag": True,
+                    "code": 0,
+                    "data": {"banned": False, "tenantApp": "ready"},
+                }
+            ),
+            FakeResponse(
+                {
+                    "flag": True,
+                    "code": 0,
+                    "data": {"totalBalance": 10, "sparkTotalBalance": 5},
+                }
+            ),
+        )
+        client = MODULE.AStudioClient(
+            wait_seconds=0,
+            client_type="22",
+            session_factory=transport,
+        )
+        waits = []
+        result = MODULE.run_account(
+            1,
+            self.account(),
+            client,
+            sleeper=lambda seconds: waits.append(seconds),
+        )
+
+        self.assertEqual(result.status, "observed")
+        self.assertEqual(result.spark_delta, Decimal("3"))
+        self.assertEqual(waits, [0.0])
+        self.assertEqual(len(transport.sessions), 4)
+        self.assertEqual(
+            [session.calls[0][0] for session in transport.sessions],
+            ["GET", "GET", "POST", "GET"],
+        )
+        for session in transport.sessions:
+            self.assertEqual(session.headers["clientType"], "22")
+            self.assertEqual(session.headers["studioVersion"], "3.5.1")
+            _, _, kwargs = session.calls[0]
+            self.assertEqual(kwargs["headers"]["Cookie"], self.account().cookie_header)
+            self.assertFalse(kwargs["allow_redirects"])
+        init_kwargs = transport.sessions[2].calls[0][2]
+        self.assertNotIn("json", init_kwargs)
+        self.assertNotIn("data", init_kwargs)
+        self.assertNotIn("files", init_kwargs)
+
+    def test_simulated_http_banned_skips_after_balance(self):
+        transport = FakeHttpTransport(
+            FakeResponse(
+                {"flag": True, "code": 0, "data": {"dailyLoginEnabled": True}}
+            ),
+            FakeResponse(
+                {
+                    "flag": True,
+                    "code": 0,
+                    "data": {"totalBalance": 10, "sparkTotalBalance": 2},
+                }
+            ),
+            FakeResponse(
+                {"flag": True, "code": 0, "data": {"banned": True}}
+            ),
+        )
+        client = MODULE.AStudioClient(
+            wait_seconds=0,
+            client_type="21",
+            session_factory=transport,
+        )
+        result = MODULE.run_account(
+            1,
+            self.account(),
+            client,
+            sleeper=lambda _: self.fail("banned request must not wait"),
+        )
+        self.assertEqual(result.status, "failed")
+        self.assertIn("封禁", result.message)
+        self.assertEqual(len(transport.sessions), 3)
+
+    def test_report_does_not_claim_success_without_observed_growth(self):
         results = [
             MODULE.RunResult(
                 1,
                 "a",
-                "unchanged",
-                "余额无变化",
+                "failed",
+                "未观察到正增长",
                 before=Decimal("1"),
                 after=Decimal("1"),
             ),
@@ -424,12 +823,12 @@ class NotificationTests(unittest.TestCase):
 
 
 class MainCliTests(unittest.TestCase):
-    def test_only_and_no_notify_are_applied(self):
+    def test_only_no_notify_and_failed_exit_code_are_applied(self):
         accounts = [
             MODULE.Account("一号", "tok-1", "acct-1"),
             MODULE.Account("二号", "tok-2", "acct-2"),
         ]
-        expected = MODULE.RunResult(2, "二号", "unchanged", "余额无变化")
+        expected = MODULE.RunResult(2, "二号", "failed", "未观察到正增长")
         with mock.patch.object(MODULE, "load_accounts", return_value=accounts):
             with mock.patch.object(MODULE, "AStudioClient"):
                 with mock.patch.object(
@@ -438,7 +837,7 @@ class MainCliTests(unittest.TestCase):
                     with mock.patch.object(MODULE, "notify_all") as notifier:
                         with mock.patch.object(MODULE, "log"):
                             code = MODULE.main(["--only", "2", "--no-notify"])
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 1)
         self.assertEqual(runner.call_count, 1)
         self.assertEqual(runner.call_args.args[0], 2)
         self.assertFalse(notifier.called)
