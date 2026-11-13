@@ -6,6 +6,8 @@
 
 **AStudio（科大讯飞 Astron Studio）每日登录积分观测工具。多账号 Cookie、桌面端初始化触发、双积分池到账核对。**
 
+> 当前版本：**v1.1.0**（2026-11-05） · 最新更新：双积分池与 init-app 每日活跃触发，领取前后余额回读
+
 [简体中文](README.md) · [English](docs/README.en.md) · [繁體中文](docs/README.zh-Hant.md) · [日本語](docs/README.ja.md) · [한국어](docs/README.ko.md) · [Português (BR)](docs/README.pt-BR.md)
 
 <img src="https://img.shields.io/github/v/release/L0NE-6/AStudio-Daily?style=for-the-badge&label=Release&color=2ea44f&logo=github" />
