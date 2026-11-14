@@ -278,8 +278,8 @@ def parse_cookie_header(cookie: str, name: str = "") -> Account:
         or values.get("ssosessionid", "")
         or values.get("sso_session_id", "")
     )
-    if not token or not account_id:
-        raise AccountConfigError("Cookie 必须包含 token 和 account_id")
+    if not account_id:
+        raise AccountConfigError("Cookie 必须包含 account_id")
     return Account(
         name=name.strip(),
         token=token,
@@ -310,9 +310,9 @@ def account_from_json_object(
     account_id = pick("accountId", "account_id")
     sso_session_id = pick("ssoSessionId", "sso_sessionid")
     name = pick("name") or fallback_name
-    if not token or not account_id:
+    if not account_id:
         raise AccountConfigError(
-            "JSON 账号必须包含 token 与 accountId/session.accountId"
+            "JSON 账号必须包含 accountId/session.accountId"
         )
     return Account(
         name=name.strip(),
