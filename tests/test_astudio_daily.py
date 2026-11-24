@@ -64,11 +64,17 @@ class FakeClient:
         config=None,
         balances=None,
         init_app=None,
+        rewards=None,
+        claimed_rewards=0,
+        claim_error=None,
         wait_seconds=2.5,
     ):
         self.config = config or {"dailyLoginEnabled": True}
         self.balances = list(balances or [{"totalBalance": 100}])
         self.init_app_data = init_app if init_app is not None else {"banned": False}
+        self.rewards = list(rewards or [])
+        self.claimed_rewards = claimed_rewards
+        self.claim_error = claim_error
         self.wait_seconds = wait_seconds
         self.calls = []
 
@@ -93,6 +99,12 @@ class FakeClient:
         if isinstance(self.init_app_data, Exception):
             raise self.init_app_data
         return self.init_app_data
+
+    def claim_daily_rewards(self, account):
+        self.calls.append("client-popups-claim")
+        if isinstance(self.claim_error, Exception):
+            raise self.claim_error
+        return self.claimed_rewards
 
 
 class AccountParsingTests(unittest.TestCase):
@@ -231,7 +243,7 @@ class ClientContractTests(unittest.TestCase):
         session = transport.sessions[0]
         self.assertEqual(session.headers["Accept"], "application/json")
         self.assertEqual(session.headers["clientType"], "21")
-        self.assertEqual(session.headers["studioVersion"], "3.5.1")
+        self.assertEqual(session.headers["studioVersion"], "3.6.0")
         method, url, kwargs = session.calls[0]
         self.assertEqual(method, "GET")
         self.assertEqual(
@@ -240,7 +252,7 @@ class ClientContractTests(unittest.TestCase):
         )
         self.assertEqual(kwargs["headers"]["Cookie"], self.account().cookie_header)
         self.assertEqual(kwargs["headers"]["clientType"], "21")
-        self.assertEqual(kwargs["headers"]["studioVersion"], "3.5.1")
+        self.assertEqual(kwargs["headers"]["studioVersion"], "3.6.0")
         self.assertFalse(kwargs["allow_redirects"])
         self.assertTrue(session.closed)
 
@@ -324,7 +336,7 @@ class ClientContractTests(unittest.TestCase):
         with self.assertRaises(MODULE.APIError):
             client.plan_config(self.account())
 
-    def test_plan_config_accepts_upstream_flag_variants(self):
+    def test_plan_config_accepts_flag_variants(self):
         for value in ("true", 1, 0, None, False):
             with self.subTest(value=value):
                 client, _ = self.make_client(
@@ -416,7 +428,7 @@ class ClientContractTests(unittest.TestCase):
         self.assertNotIn("data", kwargs)
         self.assertNotIn("files", kwargs)
         self.assertFalse(kwargs["allow_redirects"])
-        self.assertEqual(session.headers["studioVersion"], "3.5.1")
+        self.assertEqual(session.headers["studioVersion"], "3.6.0")
 
     def test_init_app_rejects_banned_and_incomplete_data(self):
         for data in ({"banned": True}, {}, {"banned": "false"}, []):
@@ -426,6 +438,41 @@ class ClientContractTests(unittest.TestCase):
                 )
                 with self.assertRaises(MODULE.APIError):
                     client.init_app(self.account())
+
+    def test_claim_daily_rewards_filters_reward_popups_and_posts_complete(self):
+        client, transport = self.make_client(
+            FakeResponse(
+                {
+                    "flag": True,
+                    "code": 0,
+                    "data": [
+                        {
+                            "popupId": 2,
+                            "popupCode": "DAILY_LOGIN_REWARD_V1",
+                            "componentType": "DAILY_REWARD_DIALOG",
+                            "instanceKey": "20261121",
+                        },
+                        {
+                            "popupId": 7,
+                            "componentType": "NEW_USER_DIALOG_V2",
+                            "instanceKey": "keep",
+                        },
+                    ],
+                }
+            ),
+            FakeResponse({"flag": True, "code": 0, "data": None}),
+        )
+        self.assertEqual(client.claim_daily_rewards(self.account()), 1)
+        self.assertEqual(len(transport.sessions), 2)
+        pending = transport.sessions[0].calls[0][2]
+        self.assertEqual(pending["headers"]["clientType"], "21")
+        self.assertEqual(pending["headers"]["studioVersion"], "3.6.0")
+        complete = transport.sessions[1].calls[0][2]
+        self.assertEqual(
+            complete["json"],
+            {"popupId": 2, "instanceKey": "20261121", "completed": True},
+        )
+        self.assertEqual(complete["headers"]["Content-Type"], "application/json")
 
     def test_each_request_uses_fresh_session_for_account_isolation(self):
         first = MODULE.Account("一", "tok-1", "acct-1", "sso-1")
@@ -457,7 +504,7 @@ class ClientContractTests(unittest.TestCase):
     def test_client_type_default_and_environment_override(self):
         cases = [
             ("win32", "", "21"),
-            ("linux", "", None),
+            ("linux", "", "21"),
             ("darwin", "", "22"),
             ("linux", "21", "21"),
         ]
@@ -488,7 +535,7 @@ class ClientContractTests(unittest.TestCase):
                         )
                         client.balance(self.account())
                 session = transport.sessions[0]
-                self.assertEqual(session.headers["studioVersion"], "3.5.1")
+                self.assertEqual(session.headers["studioVersion"], "3.6.0")
                 if expected is None:
                     self.assertNotIn("clientType", session.headers)
                     self.assertNotIn("clientType", session.calls[0][2]["headers"])
@@ -540,6 +587,7 @@ class FlowTests(unittest.TestCase):
                 "plan-config",
                 "points-balance",
                 "init-app",
+                "client-popups-claim",
                 "points-balance",
             ],
         )
@@ -570,7 +618,7 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(result.delta, Decimal("2"))
         self.assertIsNone(result.spark_delta)
 
-    def test_zero_growth_after_successful_init_app_is_failed(self):
+    def test_zero_growth_without_pending_rewards_is_done(self):
         client = FakeClient(
             balances=[
                 {"totalBalance": 10, "sparkTotalBalance": 2},
@@ -578,9 +626,31 @@ class FlowTests(unittest.TestCase):
             ]
         )
         result = MODULE.run_account(1, self.account(), client, sleeper=lambda _: None)
-        self.assertEqual(result.status, "failed")
-        self.assertIn("未观察到任何积分池正增长", result.message)
+        self.assertEqual(result.status, "done")
+        self.assertIn("今天已经领过", result.message)
         self.assertFalse(result.observed)
+
+    def test_server_confirmed_reward_without_balance_refresh_is_claimed(self):
+        client = FakeClient(
+            balances=[
+                {"totalBalance": 10},
+                {"totalBalance": 10},
+            ],
+            claimed_rewards=1,
+        )
+        result = MODULE.run_account(1, self.account(), client, sleeper=lambda _: None)
+        self.assertEqual(result.status, "claimed")
+        self.assertEqual(result.claimed_rewards, 1)
+        self.assertIn("服务端确认已领取 1 项", result.message)
+
+    def test_claim_error_is_failed_even_after_login(self):
+        client = FakeClient(
+            balances=[{"totalBalance": 10}, {"totalBalance": 10}],
+            claim_error=MODULE.APIError("推广位不存在"),
+        )
+        result = MODULE.run_account(1, self.account(), client, sleeper=lambda _: None)
+        self.assertEqual(result.status, "failed")
+        self.assertIn("推广位不存在", result.message)
 
     def test_init_app_failure_is_failed_without_after_balance(self):
         client = FakeClient(
@@ -691,6 +761,21 @@ class FlowTests(unittest.TestCase):
                 {
                     "flag": True,
                     "code": 0,
+                    "data": [
+                        {
+                            "popupId": 2,
+                            "popupCode": "DAILY_LOGIN_REWARD_V1",
+                            "componentType": "DAILY_REWARD_DIALOG",
+                            "instanceKey": "20261121",
+                        }
+                    ],
+                }
+            ),
+            FakeResponse({"flag": True, "code": 0, "data": None}),
+            FakeResponse(
+                {
+                    "flag": True,
+                    "code": 0,
                     "data": {"totalBalance": 10, "sparkTotalBalance": 5},
                 }
             ),
@@ -709,16 +794,17 @@ class FlowTests(unittest.TestCase):
         )
 
         self.assertEqual(result.status, "observed")
+        self.assertEqual(result.claimed_rewards, 1)
         self.assertEqual(result.spark_delta, Decimal("3"))
         self.assertEqual(waits, [0.0])
-        self.assertEqual(len(transport.sessions), 4)
+        self.assertEqual(len(transport.sessions), 6)
         self.assertEqual(
             [session.calls[0][0] for session in transport.sessions],
-            ["GET", "GET", "POST", "GET"],
+            ["GET", "GET", "POST", "GET", "POST", "GET"],
         )
         for session in transport.sessions:
             self.assertEqual(session.headers["clientType"], "22")
-            self.assertEqual(session.headers["studioVersion"], "3.5.1")
+            self.assertEqual(session.headers["studioVersion"], "3.6.0")
             _, _, kwargs = session.calls[0]
             self.assertEqual(kwargs["headers"]["Cookie"], self.account().cookie_header)
             self.assertFalse(kwargs["allow_redirects"])
@@ -726,6 +812,15 @@ class FlowTests(unittest.TestCase):
         self.assertNotIn("json", init_kwargs)
         self.assertNotIn("data", init_kwargs)
         self.assertNotIn("files", init_kwargs)
+        complete_kwargs = transport.sessions[4].calls[0][2]
+        self.assertEqual(
+            complete_kwargs["json"],
+            {"popupId": 2, "instanceKey": "20261121", "completed": True},
+        )
+        self.assertEqual(
+            complete_kwargs["headers"]["Content-Type"],
+            "application/json",
+        )
 
     def test_simulated_http_banned_skips_after_balance(self):
         transport = FakeHttpTransport(

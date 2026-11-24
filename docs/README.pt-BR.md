@@ -2,21 +2,21 @@
 
 [简体中文](../README.md) · [English](README.en.md) · [繁體中文](README.zh-Hant.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · [Português (BR)](README.pt-BR.md)
 
-**Dispara a inicialização desktop do AStudio (iFlytek Astron Studio) e reconcilia os dois pools de pontos com cookies de sessão web.**
+**Faz o login diário no AStudio (iFlytek Astron Studio), resgata popups de recompensa e reconcilia os dois pools de pontos com cookies de sessão web.**
 
 ## Funcionamento
-
-O contrato de referência não possui um endpoint separado de resgate. O cliente desktop inicia o fluxo diário com `POST tenant-app/v2/init-app`, sem body.
 
 1. lê `membership/plan-config`;
 2. encerra apenas quando o booleano `dailyLoginEnabled=false`;
 3. lê `totalBalance` e `sparkTotalBalance` antes da inicialização;
 4. envia `POST tenant-app/v2/init-app`, sem body;
-5. aguarda 2,5 segundos;
-6. lê novamente os dois pools de pontos;
-7. relata `observed` quando qualquer pool cresce claramente.
+5. lê `client-popups/pending`;
+6. conclui apenas itens `DAILY_REWARD_DIALOG` ou que contenham `REWARD`;
+7. aguarda 2,5 segundos;
+8. lê novamente os dois pools de pontos;
+9. relata `observed`, `claimed`, `done` ou `failed` conforme a evidência do servidor.
 
-Se a inicialização funcionar, mas nenhum pool crescer, a conta é reportada como `failed` e o processo termina com código diferente de zero. Um delta positivo prova apenas que o saldo mudou; a origem não é inferida.
+O `init-app` registra apenas o login do dia e não concede pontos sozinho. Um delta positivo prova apenas que o saldo mudou; a origem não é inferida.
 
 ## Formatos de conta
 
@@ -49,7 +49,7 @@ python astudio_daily.py --no-notify
 | `ASTUDIO_COOKIES` | sim* | Cookies de várias contas. |
 | `ASTUDIO_ACCOUNT_FILE` | opcional | Arquivo de contas. |
 | `ASTUDIO_PROXY` | opcional | Proxy HTTP(S). |
-| `ASTUDIO_CLIENT_TYPE` | opcional | Substitui `clientType`. Windows usa `21`, macOS `22`; Linux omite por padrão. |
+| `ASTUDIO_CLIENT_TYPE` | opcional | Substitui `clientType`. Windows/Linux usam `21`, macOS `22`. |
 | `ASTUDIO_TIMEOUT` | opcional | Timeout, padrão `20` s. |
 | `ASTUDIO_WAIT_SECONDS` | opcional | Espera antes da nova leitura, padrão `2,5` s. |
 | `PUSHPLUS_TOKEN` | opcional | PushPlus. |
@@ -63,9 +63,11 @@ python astudio_daily.py --no-notify
 | Estado | Significado |
 | :--- | :--- |
 | `observed` | Pelo menos um pool de pontos aumentou nesta execução. |
+| `claimed` | O servidor confirmou a conclusão do popup, mas o saldo ainda não foi atualizado. |
+| `done` | Login concluído e nenhuma recompensa pendente, normalmente porque já foi resgatada hoje. |
 | `disabled` | Atividade diária desativada. |
 | `query` | Consulta somente leitura. |
-| `failed` | Sessão, HTTP, contrato, saldo ilegível, inicialização ou zero crescimento após inicialização bem-sucedida. |
+| `failed` | Falha de sessão, HTTP, contrato, leitura de saldo, inicialização ou resgate da recompensa. |
 
 ## Contrato HTTP
 
@@ -74,19 +76,22 @@ python astudio_daily.py --no-notify
 - Cookies: `ssoSessionId`, `sso_sessionid`, `account_id`, `token`
 - Leituras diárias: `GET membership/plan-config`, `GET points/balance`
 - Ativação: `POST tenant-app/v2/init-app` sem body, com o cookie da conta
-- Todas as requisições da conta usam `studioVersion: 3.5.1`
-- Windows usa `clientType=21`, macOS `22`; Linux omite por padrão e aceita `ASTUDIO_CLIENT_TYPE`
+- Recompensas pendentes: `GET client-popups/pending`
+- Resgate: `POST client-popups/complete` com `{popupId, instanceKey, completed:true}`
+- Todas as requisições usam `studioVersion: 3.6.0` e `User-Agent: AStudio/3.6.0`
+- Windows/Linux usam `clientType=21`, macOS `22`
 - Sucesso exige `flag=true`, `code=0` e `data` completo; `init-app` também exige `banned=false`
+- `client-popups/complete` pode retornar `data:null` em caso de sucesso
 - GeeTest é necessário para envio de SMS e login por senha
-- Não foi encontrado token/header CSRF separado na evidência de referência
+- Não foi encontrado token/header CSRF separado na evidência atual do protocolo
 
 Consulte [PROTOCOL.md](PROTOCOL.md).
 
 ## Versão
 
-- Script: `v1.1.0`
-- Base: `Agent2Providers v3.4.2` / `3055f416841c1393ec04294a702603fd41e840aa`
-- Regressão offline: 49 testes unittest
+- Script: `v1.2.0`
+- Protocolo: AStudio desktop `3.6.0`
+- Regressão offline: 52 testes unittest
 
 ## Segurança
 

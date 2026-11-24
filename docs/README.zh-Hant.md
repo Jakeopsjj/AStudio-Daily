@@ -2,11 +2,9 @@
 
 [简体中文](../README.md) · [English](README.en.md) · [繁體中文](README.zh-Hant.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · [Português (BR)](README.pt-BR.md)
 
-**使用網頁會話 Cookie 觸發 AStudio（科大訊飛 Astron Studio）桌面端帳號初始化，並分別核對兩個積分池。**
+**使用網頁會話 Cookie 完成 AStudio（科大訊飛 Astron Studio）每日登入、領取獎勵彈窗，並分別核對兩個積分池。**
 
 ## 功能
-
-參考契約中沒有獨立的每日積分領取介面。桌面端以無 body 的 `POST tenant-app/v2/init-app` 觸發當日流程。
 
 流程：
 
@@ -14,11 +12,13 @@
 2. 僅布林值 `dailyLoginEnabled=false` 時以中性狀態結束；
 3. 讀取 `totalBalance` 與 `sparkTotalBalance` 前值；
 4. 送出無 body 的 `POST tenant-app/v2/init-app`；
-5. 等待 2.5 秒；
-6. 再次讀取兩個積分池；
-7. 任一池明確正增長時報告 `observed`。
+5. 讀取 `client-popups/pending`；
+6. 僅完成 `DAILY_REWARD_DIALOG` 或含 `REWARD` 的獎勵彈窗；
+7. 等待 2.5 秒；
+8. 再次讀取兩個積分池；
+9. 依服務端證據報告 `observed`、`claimed`、`done` 或 `failed`。
 
-初始化成功但兩池均未正增長時回報 `failed`，程序退出碼非 0。正差額只證明餘額發生變化，不推斷來源。
+`init-app` 只記錄當日登入，不會單獨發放積分。正差額只證明餘額發生變化，不推斷來源。
 
 ## 帳號格式
 
@@ -51,7 +51,7 @@ python astudio_daily.py --no-notify
 | `ASTUDIO_COOKIES` | 是* | 多帳號 Cookie。 |
 | `ASTUDIO_ACCOUNT_FILE` | 否 | 帳號檔路徑。 |
 | `ASTUDIO_PROXY` | 否 | HTTP(S) 代理。 |
-| `ASTUDIO_CLIENT_TYPE` | 否 | 覆寫 `clientType`。Windows 預設 `21`、macOS `22`；Linux 預設不送。 |
+| `ASTUDIO_CLIENT_TYPE` | 否 | 覆寫 `clientType`。Windows/Linux 預設 `21`、macOS `22`。 |
 | `ASTUDIO_TIMEOUT` | 否 | 請求逾時，預設 `20` 秒。 |
 | `ASTUDIO_WAIT_SECONDS` | 否 | 餘額複查等待，預設 `2.5` 秒。 |
 | `PUSHPLUS_TOKEN` | 否 | PushPlus。 |
@@ -65,9 +65,11 @@ python astudio_daily.py --no-notify
 | 狀態 | 說明 |
 | :--- | :--- |
 | `observed` | 本輪至少一個積分池增加，不推斷增長來源。 |
+| `claimed` | 服務端已確認獎勵彈窗領取成功，但本輪餘額尚未刷新。 |
+| `done` | 登入完成且沒有待領取獎勵，通常表示今天已經領過。 |
 | `disabled` | 每日登入活動未啟用。 |
 | `query` | 僅查詢，未觸發活躍。 |
-| `failed` | 會話、HTTP、契約、餘額不可讀、初始化失敗，或初始化成功後零增長。 |
+| `failed` | 會話、HTTP、契約、餘額不可讀、初始化或獎勵彈窗領取失敗。 |
 
 ## 協議摘要
 
@@ -76,18 +78,21 @@ python astudio_daily.py --no-notify
 - Cookie：`ssoSessionId`、`sso_sessionid`、`account_id`、`token`
 - 日常讀取：`GET membership/plan-config`、`GET points/balance`
 - 活躍觸發：帶 Cookie 的無 body `POST tenant-app/v2/init-app`
-- 所有帳號面請求帶 `studioVersion: 3.5.1`
-- Windows `clientType=21`、macOS `22`；Linux 預設不送，可用 `ASTUDIO_CLIENT_TYPE` 覆寫
+- 待領取獎勵：`GET client-popups/pending`
+- 領取獎勵：`POST client-popups/complete`，JSON `{popupId, instanceKey, completed:true}`
+- 所有帳號面請求帶 `studioVersion: 3.6.0`、`User-Agent: AStudio/3.6.0`
+- Windows/Linux `clientType=21`、macOS `22`
 - 成功信封必須同時滿足 `flag=true`、`code=0`、`data` 完整；`init-app` 另要求 `banned=false`
-- 發送簡訊與密碼登入需要極驗；參考證據未發現獨立 CSRF token/header
+- `client-popups/complete` 成功時允許 `data:null`
+- 發送簡訊與密碼登入需要極驗；現有協議證據未發現獨立 CSRF token/header
 
 完整證據見 [PROTOCOL.md](PROTOCOL.md)。
 
 ## 版本
 
-- 腳本：`v1.1.0`
-- 基線：`Agent2Providers v3.4.2` / `3055f416841c1393ec04294a702603fd41e840aa`
-- 離線回歸：49 項 unittest
+- 腳本：`v1.2.0`
+- 協議版本：AStudio 桌面端 `3.6.0`
+- 離線回歸：52 項 unittest
 
 ## 安全
 
