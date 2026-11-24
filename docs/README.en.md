@@ -2,11 +2,9 @@
 
 [简体中文](../README.md) · [English](README.en.md) · [繁體中文](README.zh-Hant.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · [Português (BR)](README.pt-BR.md)
 
-**Trigger the AStudio (iFlytek Astron Studio) desktop account initialization and reconcile both credit pools with account cookies.**
+**Sign in to AStudio (iFlytek Astron Studio), claim daily reward popups, and reconcile both credit pools with account cookies.**
 
 ## What it does
-
-AStudio does not expose a separate daily-credit claim endpoint. The reference client triggers the daily flow with a bodyless `tenant-app/v2/init-app` POST.
 
 This script:
 
@@ -14,11 +12,13 @@ This script:
 2. stops only when the boolean `dailyLoginEnabled` is `false`;
 3. reads `totalBalance` and `sparkTotalBalance` before activation;
 4. sends a bodyless `POST tenant-app/v2/init-app`;
-5. waits 2.5 seconds;
-6. reads both credit pools from `points/balance` again;
-7. reports `observed` when either pool increases clearly.
+5. reads `client-popups/pending`;
+6. completes only `DAILY_REWARD_DIALOG` or `REWARD` popup entries;
+7. waits 2.5 seconds;
+8. reads both credit pools from `points/balance` again;
+9. reports `observed`, `claimed`, `done`, or `failed` from the server evidence.
 
-If initialization succeeds but neither pool increases, the account is reported as `failed` and the process exits non-zero. A positive delta proves only that the balance changed; it does not identify the source.
+`init-app` records the daily login but does not grant the credits by itself. A positive delta proves only that the balance changed; it does not identify the source.
 
 ## Account formats
 
@@ -65,7 +65,7 @@ python astudio_daily.py --no-notify
 | `ASTUDIO_COOKIES` | yes* | Multi-account cookie payload. |
 | `ASTUDIO_ACCOUNT_FILE` | optional | Path to an account file. |
 | `ASTUDIO_PROXY` | optional | HTTP(S) proxy. |
-| `ASTUDIO_CLIENT_TYPE` | optional | Overrides `clientType`. Defaults to `21` on Windows and `22` on macOS; omitted on Linux. |
+| `ASTUDIO_CLIENT_TYPE` | optional | Overrides `clientType`. Defaults to `21` on Windows/Linux and `22` on macOS. |
 | `ASTUDIO_TIMEOUT` | optional | Request timeout, default `20`. |
 | `ASTUDIO_WAIT_SECONDS` | optional | Balance recheck delay, default `2.5`. |
 | `PUSHPLUS_TOKEN` | optional | PushPlus. |
@@ -79,9 +79,11 @@ python astudio_daily.py --no-notify
 | Status | Meaning |
 | :--- | :--- |
 | `observed` | At least one credit pool increased in this run; the source is not inferred. |
+| `claimed` | The server confirmed reward-popup completion, but the balance has not refreshed yet. |
+| `done` | Login completed and no daily reward is pending, usually because it was already claimed today. |
 | `disabled` | Daily login activity is disabled. |
 | `query` | Read-only query mode. |
-| `failed` | Session, HTTP, contract, unreadable balance, initialization failure, or zero growth after successful initialization. |
+| `failed` | Session, HTTP, contract, unreadable balance, initialization, or reward-claim failure. |
 
 ## HTTP contract
 
@@ -90,19 +92,22 @@ python astudio_daily.py --no-notify
 - Cookie names: `ssoSessionId`, `sso_sessionid`, `account_id`, `token`
 - Daily reads: `GET membership/plan-config`, `GET points/balance`
 - Activation: bodyless `POST tenant-app/v2/init-app` with the account cookie
-- All account requests send `studioVersion: 3.5.1`
-- `clientType` is `21` on Windows and `22` on macOS; Linux omits it unless `ASTUDIO_CLIENT_TYPE` overrides it
+- Pending rewards: `GET client-popups/pending`
+- Reward completion: `POST client-popups/complete` with `{popupId, instanceKey, completed:true}`
+- All account requests send `studioVersion: 3.6.0` and `User-Agent: AStudio/3.6.0`
+- `clientType` is `21` on Windows/Linux and `22` on macOS
 - Success requires `flag=true`, `code=0`, and complete `data`; `init-app` also requires `banned=false`
+- `client-popups/complete` may return `data:null` on success
 - GeeTest is required for SMS sending and password login
-- No separate CSRF token/header is visible in the reference evidence
+- No separate CSRF token/header is visible in the current protocol evidence
 
 See [PROTOCOL.md](PROTOCOL.md) for source-level evidence.
 
 ## Version
 
-- Script: `v1.1.0`
-- Baseline: `Agent2Providers v3.4.2` / `3055f416841c1393ec04294a702603fd41e840aa`
-- Offline regression: 49 unittest cases
+- Script: `v1.2.0`
+- Protocol: AStudio desktop `3.6.0`
+- Offline regression: 52 unittest cases
 
 ## Security
 

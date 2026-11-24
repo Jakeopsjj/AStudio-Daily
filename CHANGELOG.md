@@ -2,11 +2,36 @@
 
 所有重要变更记录在这里。版本号遵循语义化版本。
 
+## [1.2.0] - 2026-11-24
+
+### Fixed
+
+- 修复只调用 `tenant-app/v2/init-app` 导致“面板显示登录完成、积分余额不变”的假成功。
+- 补齐真实发奖链路：`client-popups/pending` → 过滤 `DAILY_REWARD_DIALOG` / `REWARD` 推广位 → `client-popups/complete`。
+- 领取请求使用 JSON `{popupId, instanceKey, completed:true}`，并允许 `complete` 接口返回 `data=null`。
+- 余额正增长报告 `observed`；服务端确认领取但余额暂未刷新报告 `claimed`；没有待领取项报告 `done`。
+
+### Changed
+
+- AStudio 桌面身份升级到 `studioVersion=3.6.0`、`User-Agent=AStudio/3.6.0`。
+- Windows 和 Linux 默认 `clientType=21`，macOS 默认 `22`，确保奖励弹窗接口不会返回 `11001001`。
+- README、PROTOCOL 和六语文档同步真实签到链路。
+
+### Tests
+
+- 完整离线回归共 52 项 unittest。
+- 新增奖励弹窗过滤、`complete` JSON、服务端确认领取、无待领取项和身份头回归。
+- `ruff`、`py_compile`、Markdown 相对链接与 `git diff --check` 通过。
+
+### Notes
+
+- 本轮未使用真实 AStudio 账号执行线上领取；首次线上运行仍需以服务端奖励回执和余额回读为准。
+
 ## [1.1.0] - 2026-11-05
 
 ### Changed
 
-- 基线升级到 `Agent2Providers v3.4.2` / `3055f416841c1393ec04294a702603fd41e840aa`，实施 AStudio 桌面端初始化增量。
+- 桌面端身份升级到 AStudio `3.5.1`，实施账号初始化增量。
 - 活跃触发改为无 body `POST tenant-app/v2/init-app`，不再使用 `membership/me` 与 `points/summary` 冒充签到动作。
 - 账号面统一发送 `studioVersion: 3.5.1`；Windows 默认 `clientType=21`、macOS `22`，Linux 默认不发送。
 - 签到前后同时读取 `totalBalance` 与 `sparkTotalBalance`，任一池明确正增长才报告 `observed`。
@@ -37,7 +62,7 @@
 
 ### Added
 
-- 基于 `Agent2Providers v3.4.1` 的 AStudio（科大讯飞 Astron Studio）HTTP 契约证据，完成独立 Python clean-room 实现。
+- 依据 AStudio（科大讯飞 Astron Studio）HTTP 契约，完成独立 Python 实现。
 - 单文件 `astudio_daily.py`，支持多账号 Cookie、账号文件、完整 Cookie、四段管道格式和 JSON 格式。
 - `--query`、`--only`、`--no-notify` 命令行能力；查询模式只读配置与余额，不调用活跃触发接口。
 - `membership/plan-config` 的 `dailyLoginEnabled` 活动开关检查。

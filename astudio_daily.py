@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """AStudio（科大讯飞 Astron Studio）每日登录积分观测工具。
 
-上游事实（Agent2Providers v3.4.2 / 3055f416，只读协议证据）：
-  - 每日登录奖励由桌面端启动时的账号初始化触发，没有独立 claim 接口。
+AStudio 3.6.0 协议事实：
+  - tenant-app/v2/init-app 只记录当天登录，不直接发放积分。
+  - 真正的每日登录积分在 client-popups/pending 的 DAILY_REWARD_DIALOG 项里。
+  - 对奖励项 POST client-popups/complete 后，才会到账。
   - 账号面根地址：https://agent.xfyun.cn/xingchen-studio/
   - 配置：GET membership/plan-config
   - 余额：GET points/balance
   - 活跃触发：POST tenant-app/v2/init-app，带 Cookie，无请求体
-  - 账号面请求统一发送 studioVersion=3.5.1；仅在 Windows/macOS 或环境覆盖时
-    发送 clientType（Windows 21、macOS 22）。
+  - 账号面请求统一发送 studioVersion=3.6.0；Windows/Linux 默认 clientType=21、
+    macOS 默认 clientType=22。
   - 成功信封必须同时满足 flag=true、code=0、data 非空；init-app 的 data
     还必须包含布尔 banned，且 banned=false。
-  - 签到前后分别读取 totalBalance 与 sparkTotalBalance，任一积分池明确正增长
-    才报告 observed；两池都无法成对读取时失败，零增长不伪报成功。
+  - 签到前后分别读取 totalBalance 与 sparkTotalBalance；余额增长报告 observed，
+    服务端确认领取但余额暂未刷新报告 claimed，没有待领取项报告 done。
 
 本脚本只使用网页会话 Cookie，不持久化凭据，不读取桌面端文件。
 
@@ -49,16 +51,18 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import requests
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 ACCOUNT_API_BASE = "https://agent.xfyun.cn/xingchen-studio/"
 PLAN_CONFIG_PATH = "membership/plan-config"
 POINTS_BALANCE_PATH = "points/balance"
 INIT_APP_PATH = "tenant-app/v2/init-app"
-STUDIO_VERSION = "3.5.1"
+CLIENT_POPUPS_PENDING_PATH = "client-popups/pending"
+CLIENT_POPUPS_COMPLETE_PATH = "client-popups/complete"
+STUDIO_VERSION = "3.6.0"
 DEFAULT_ACCOUNT_FILE = "astudio_accounts.txt"
 DEFAULT_TIMEOUT = 20
 DEFAULT_WAIT_SECONDS = 2.5
-USER_AGENT = "undici"
+USER_AGENT = "AStudio/3.6.0"
 PHONE_PATTERN = re.compile(r"(?<!\d)(?:\+?86[- ]?)?(1[3-9]\d{9})(?!\d)")
 class AStudioError(Exception):
     """AStudio Daily 的受控错误基类。"""
@@ -126,6 +130,7 @@ class RunResult:
     before_spark: Optional[Decimal] = None
     after_spark: Optional[Decimal] = None
     spark_delta: Optional[Decimal] = None
+    claimed_rewards: int = 0
     plan: str = ""
     plan_name: str = ""
     detail_lines: List[str] = field(default_factory=list)
@@ -166,7 +171,7 @@ def configured_client_type() -> Optional[str]:
         return "21"
     if sys.platform == "darwin":
         return "22"
-    return None
+    return "21"
 
 
 def redact_phone(text: str) -> str:
@@ -473,7 +478,14 @@ class AStudioClient:
             session.proxies.update({"http": self.proxy, "https": self.proxy})
         return session
 
-    def _request(self, account: Account, method: str, path: str) -> Any:
+    def _request(
+        self,
+        account: Account,
+        method: str,
+        path: str,
+        json_body: Optional[Dict[str, Any]] = None,
+        allow_empty: bool = False,
+    ) -> Any:
         url = self._url(path)
         session = self._new_session()
         try:
@@ -487,6 +499,10 @@ class AStudioClient:
             if method == "GET":
                 response = session.get(url, **kwargs)
             elif method == "POST":
+                if json_body is not None:
+                    headers["Content-Type"] = "application/json"
+                    kwargs["headers"] = headers
+                    kwargs["json"] = json_body
                 response = session.post(url, **kwargs)
             else:
                 raise APIError("不支持的账号面请求方法：%s" % method)
@@ -536,6 +552,8 @@ class AStudioClient:
             raise APIError("%s 返回的成功状态不完整（HTTP %d）" % (path, status))
 
         if "data" not in payload or payload.get("data") is None:
+            if allow_empty:
+                return None
             raise APIError("%s 返回的数据不完整（HTTP %d）" % (path, status))
 
         data = payload.get("data")
@@ -546,6 +564,21 @@ class AStudioClient:
 
     def post_empty(self, account: Account, path: str) -> Any:
         return self._request(account, "POST", path)
+
+    def post_json(
+        self,
+        account: Account,
+        path: str,
+        payload: Dict[str, Any],
+        allow_empty: bool = False,
+    ) -> Any:
+        return self._request(
+            account,
+            "POST",
+            path,
+            json_body=payload,
+            allow_empty=allow_empty,
+        )
 
     def plan_config(self, account: Account) -> Dict[str, Any]:
         data = self.get(account, PLAN_CONFIG_PATH)
@@ -583,6 +616,48 @@ class AStudioClient:
             raise APIError("AStudio 账号已被封禁，无法签到")
         return data
 
+    def pending_rewards(self, account: Account) -> List[Dict[str, Any]]:
+        data = self.get(account, CLIENT_POPUPS_PENDING_PATH)
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict) and isinstance(data.get("popups"), list):
+            items = data["popups"]
+        else:
+            raise APIError("client-popups/pending 的 data 不是奖励列表")
+
+        rewards: List[Dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            component = str(item.get("componentType") or "").strip()
+            popup_code = str(item.get("popupCode") or "").strip().upper()
+            if component == "DAILY_REWARD_DIALOG" or "REWARD" in popup_code:
+                rewards.append(item)
+        return rewards
+
+    def claim_daily_rewards(self, account: Account) -> int:
+        claimed = 0
+        for item in self.pending_rewards(account):
+            try:
+                popup_id = int(str(item.get("popupId") or "").strip())
+            except (TypeError, ValueError):
+                continue
+            instance_key = str(item.get("instanceKey") or "").strip()
+            if not instance_key:
+                continue
+            self.post_json(
+                account,
+                CLIENT_POPUPS_COMPLETE_PATH,
+                {
+                    "popupId": popup_id,
+                    "instanceKey": instance_key,
+                    "completed": True,
+                },
+                allow_empty=True,
+            )
+            claimed += 1
+        return claimed
+
 
 def balance_detail(balance: Balance) -> str:
     parts: List[str] = []
@@ -600,6 +675,8 @@ def balance_detail(balance: Balance) -> str:
 def result_line(result: RunResult) -> str:
     icon = {
         "observed": "✅",
+        "claimed": "🧾",
+        "done": "☑️",
         "disabled": "ℹ️",
         "query": "🔎",
         "failed": "❌",
@@ -649,6 +726,12 @@ def run_account(
 
         before = client.balance(account)
         client.init_app(account)
+        claim_error: Optional[AStudioError] = None
+        claimed_rewards = 0
+        try:
+            claimed_rewards = client.claim_daily_rewards(account)
+        except AStudioError as error:
+            claim_error = error
         wait_seconds = max(0.0, float(client.wait_seconds))
         sleeper(wait_seconds)
         after = client.balance(account)
@@ -667,6 +750,7 @@ def run_account(
         detail_lines = [
             "签到前：%s" % balance_detail(before),
             "签到后：%s" % balance_detail(after),
+            "服务端确认领取：%d 项" % claimed_rewards,
         ]
 
         if delta is None and spark_delta is None:
@@ -679,6 +763,7 @@ def run_account(
                 after=after.total,
                 before_spark=before.spark_total,
                 after_spark=after.spark_total,
+                claimed_rewards=claimed_rewards,
                 plan="AStudio",
                 detail_lines=detail_lines,
             )
@@ -704,6 +789,44 @@ def run_account(
                 before_spark=before.spark_total,
                 after_spark=after.spark_total,
                 spark_delta=spark_delta,
+                claimed_rewards=claimed_rewards,
+                plan="AStudio",
+                detail_lines=detail_lines,
+            )
+
+        if claimed_rewards > 0:
+            return RunResult(
+                index=index,
+                label=label,
+                status="claimed",
+                message=(
+                    "服务端确认已领取 %d 项每日登录奖励，"
+                    "积分余额暂未刷新；稍后回读可见" % claimed_rewards
+                ),
+                before=before.total,
+                after=after.total,
+                delta=delta,
+                before_spark=before.spark_total,
+                after_spark=after.spark_total,
+                spark_delta=spark_delta,
+                claimed_rewards=claimed_rewards,
+                plan="AStudio",
+                detail_lines=detail_lines,
+            )
+
+        if claim_error is not None:
+            return RunResult(
+                index=index,
+                label=label,
+                status="failed",
+                message="登录成功，但领取每日登录积分失败：%s"
+                % sanitize_message(claim_error, account),
+                before=before.total,
+                after=after.total,
+                delta=delta,
+                before_spark=before.spark_total,
+                after_spark=after.spark_total,
+                spark_delta=spark_delta,
                 plan="AStudio",
                 detail_lines=detail_lines,
             )
@@ -711,11 +834,8 @@ def run_account(
         return RunResult(
             index=index,
             label=label,
-            status="failed",
-            message=(
-                "每日登录初始化成功，但未观察到任何积分池正增长；"
-                "可能今日已领取或尚未到账，本次不确认成功"
-            ),
+            status="done",
+            message="今日登录已完成，没有待领取的登录积分（今天已经领过）",
             before=before.total,
             after=after.total,
             delta=delta,
@@ -813,6 +933,8 @@ def notify_all(title: str, content: str) -> None:
 
 def build_report(results: Sequence[RunResult], query_only: bool) -> str:
     observed = sum(1 for item in results if item.status == "observed")
+    claimed = sum(1 for item in results if item.status == "claimed")
+    done = sum(1 for item in results if item.status == "done")
     disabled = sum(1 for item in results if item.status == "disabled")
     queried = sum(1 for item in results if item.status == "query")
     failed = sum(1 for item in results if item.status == "failed")
@@ -823,15 +945,18 @@ def build_report(results: Sequence[RunResult], query_only: bool) -> str:
             "账号：%d；查询完成：%d；失败：%d"
             % (len(results), queried, failed)
             if query_only
-            else "账号：%d；观察增长：%d；未启用：%d；失败：%d"
-            % (len(results), observed, disabled, failed)
+            else (
+                "账号：%d；到账增长：%d；服务端确认领取：%d；"
+                "今日已完成：%d；未启用：%d；失败：%d"
+                % (len(results), observed, claimed, done, disabled, failed)
+            )
         ),
         "",
     ]
     for result in results:
         lines.append(result_line(result))
         lines.extend("  %s" % detail for detail in result.detail_lines)
-    if observed == 0:
+    if observed == 0 and claimed == 0:
         lines.extend(["", "结论：本轮没有账号观察到余额增长。"])
     return "\n".join(lines)
 
