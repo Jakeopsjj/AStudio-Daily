@@ -18,7 +18,7 @@
 <img src="https://img.shields.io/badge/License-MIT-F472B6?style=for-the-badge" />
 <a href="https://github.com/L0NE-6/AStudio-Daily/releases"><img src="https://img.shields.io/badge/%E2%AC%87%20Download-Releases-2ea44f?style=for-the-badge&logo=github" /></a>
 
-[✨ 30 秒速览](#-30-秒速览) · [🔑 账号格式](#-账号格式) · [🚀 青龙面板](#-青龙面板) · [☁️ GitHub Actions](#-github-actions) · [🔧 环境变量](#-环境变量) · [📡 协议证据](#-协议证据) · [❓ 常见问题](#-常见问题) · [✦ 星轨](#-星轨-star-trail)
+[✨ 30 秒速览](#-30-秒速览) · [🔑 账号格式](#-账号格式) · [🚀 青龙面板](#-青龙面板) · [☁️ GitHub Actions](#-github-actions) · [🔧 环境变量](#-环境变量) · [🧭 结果码](#result-codes) · [✅ 成功判据](#success) · [🧠 原则](#design) · [📁 目录](#directory) · [📡 协议证据](#-协议证据) · [❓ 常见问题](#-常见问题) · [✦ 星轨](#-星轨-star-trail)
 
 </div>
 
@@ -189,7 +189,8 @@ schedule:
 | `--no-notify` | 关闭本轮推送。 |
 | `--version` | 输出版本。 |
 
-## 📊 状态语义
+<a id="result-codes"></a>
+## 🧭 结果码与状态语义
 
 | 状态 | 含义 |
 | :--- | :--- |
@@ -201,6 +202,35 @@ schedule:
 | `failed` | 会话失效、HTTP/业务错误、余额不可读、初始化失败，或奖励弹窗领取失败。 |
 
 脚本退出码：存在 `failed` 时为 `1`，配置错误为 `2`，其余为 `0`。
+
+---
+
+<a id="success"></a>
+## ✅ 成功判据
+
+| 场景 | 可信结论 |
+| :--- | :--- |
+| 双池任一明确正增长 | `observed` |
+| 服务端确认奖励弹窗领取，但余额暂未刷新 | `claimed` |
+| 登录完成且没有待领取奖励 | `done` |
+| 仅布尔 `dailyLoginEnabled=false` | `disabled` |
+| 查询模式 | `query` |
+| 会话、HTTP、余额、初始化或弹窗领取失败 | `failed` |
+
+`claimed` 证明服务端接受领取，不证明余额已经刷新；`observed` 证明本轮看到增长，但不区分增长来源。
+
+---
+
+<a id="design"></a>
+## 🧠 设计原则
+
+- **真实发奖链路**：初始化之后继续读取奖励弹窗并提交 `complete`；
+- **双积分池回读**：`totalBalance` 与 `sparkTotalBalance` 分别记录；
+- **不伪报成功**：零增长、无待领取项、领取确认和余额增长分别建模；
+- **平台身份对齐**：版本、`clientType` 和请求头按桌面端平台生成；
+- **多账号隔离**：每个账号独立 Session、独立错误；
+- **Cookie 最小暴露**：不打印 Cookie、UID、account_id 或 ssoSessionId；
+- **不跟随重定向**：避免凭据被带往非目标主机。
 
 ## 📡 协议证据
 
@@ -286,7 +316,35 @@ python -m py_compile astudio_daily.py tests/test_astudio_daily.py
 `--only` 按最终合并后的账号列表计数。`ASTUDIO_COOKIES` 中的账号在前，账号文件中的新账号随后；重复凭据会自动去重。
 </details>
 
-## 📦 版本
+<a id="directory"></a>
+## 📁 目录结构
+
+```text
+AStudio-Daily/
+├── .github/workflows/astudio.yml
+├── assets/
+│   ├── donate-alipay.jpg
+│   └── donate-wechat.png
+├── docs/
+│   ├── PROTOCOL.md
+│   ├── README.en.md
+│   ├── README.zh-Hant.md
+│   ├── README.ja.md
+│   ├── README.ko.md
+│   └── README.pt-BR.md
+├── tests/test_astudio_daily.py
+├── astudio_daily.py
+├── CHANGELOG.md
+├── LICENSE
+├── NOTICE.md
+├── pyproject.toml
+├── requirements.txt
+└── README.md
+```
+
+---
+
+## 📦 版本与发布
 
 - 当前脚本版本：`v1.2.0`
 - 协议版本：AStudio 桌面端 `3.6.0`
@@ -297,9 +355,7 @@ python -m py_compile astudio_daily.py tests/test_astudio_daily.py
 
 本项目用于个人自动化实践与协议互操作研究。请遵守 AStudio 及相关平台的服务条款，并自行承担账号、网络、Cookie 有效期和自动化使用风险。
 
-## ☕ 支持与反馈
-
-遇到 Cookie 失效、字段变更或余额语义问题，请附脱敏日志、AStudio 版本、运行时间和复现步骤提交 Issue。
+## ☕ 支持与投喂
 
 <p align="center">
   <img src="assets/donate-wechat.png" width="260" alt="微信赞赏码" />
@@ -307,6 +363,15 @@ python -m py_compile astudio_daily.py tests/test_astudio_daily.py
   <img src="assets/donate-alipay.jpg" width="260" alt="支付宝赞赏码" />
 </p>
 <p align="center"><sub>💚 微信支付（左） &nbsp;|&nbsp; 💙 支付宝（右）</sub></p>
+
+---
+
+## 💬 反馈与贡献
+
+- [提交 Issue](https://github.com/L0NE-6/AStudio-Daily/issues)
+- [发起 Pull Request](https://github.com/L0NE-6/AStudio-Daily/pulls)
+
+遇到 Cookie 失效、字段变更、余额语义或奖励弹窗问题时，请附脱敏日志、AStudio 版本、运行时间、平台和复现步骤。不要上传真实 Cookie、UID、account_id 或完整运行日志。
 
 ---
 
